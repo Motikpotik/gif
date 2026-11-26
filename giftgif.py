@@ -1,7 +1,7 @@
 # ◇━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━◇
 # meta developer: @n3post
 # scope: Heroku, Hikka
-# version: 1.4.24
+# version: 1.4.25
 # author: n3
 # Description: Подарок Telegram → анимированная карточка GIF или MP4.
 # Собирает ту же карточку, что показывает приложение: градиентный фон,
@@ -18,6 +18,10 @@
 # плитку, нижний ряд включён) — в 1.4.5 низ плитки оставался пустым.
 # 1.4.9: команда .giftest — проверка на трёх печеньках: узор по третям,
 # габарит модели, живая ли анимация, плюс скриншот кадра в чат.
+# 1.4.25: прямой sendMedia теперь действительно работает. random_id брался
+# из беззнаковых 64 бит, а в MTProto это знаковый int64 — struct.pack('<q')
+# падал с «'q' format requires …», и КАЖДАЯ гифка с 1.4.20 уходила резервным
+# путём (видно в логах: «gif: sendMedia не удался»). Теперь маска 2^63-1.
 # 1.4.24: главный баг гифки с 1.4.17 — normalize_fmt("animation") превращал
 # режим анимации в mp4, поэтому гифка собиралась СО звуковой дорожкой, а с
 # ней Telegram обязан показывать видео с плеером. Теперь .gif gif / format:gif
@@ -132,7 +136,19 @@ except Exception:  # pragma: no cover
     loader = utils = None
 
 
-MODULE_VERSION = "1.4.24"
+MODULE_VERSION = "1.4.25"
+
+INT64_MAX = 0x7FFFFFFFFFFFFFFF       # random_id в MTProto — знаковый int64
+
+
+def _random_id() -> int:
+    """Случайный random_id в пределах знакового int64.
+
+    `int.from_bytes(os.urandom(8), "big")` может дать число больше 2^63-1, и
+    struct.pack('<q') падает с «'q' format requires …» — из-за этого в 1.4.20
+    прямой sendMedia не срабатывал никогда и гифка уходила резервным путём.
+    """
+    return int.from_bytes(os.urandom(8), "big") & INT64_MAX
 
 logger = logging.getLogger("giftgif")
 
@@ -2632,7 +2648,7 @@ class GiftGif(loader.Module):
                 tl_root.functions.messages.SendMediaRequest(
                     peer=await message.client.get_input_entity(message.chat_id),
                     media=media, message=caption or "",
-                    random_id=int.from_bytes(os.urandom(8), "big")))
+                    random_id=_random_id()))
             logger.debug("gif: sendMedia ok, attrs=%s",
                          GiftGif._sent_attributes_sync(sent))
             return sent
