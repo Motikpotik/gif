@@ -1,7 +1,7 @@
 # ◇━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━◇
 # meta developer: @n3post
 # scope: Heroku, Hikka
-# version: 1.4.26
+# version: 1.4.27
 # author: n3
 # Description: Подарок Telegram → анимированная карточка GIF или MP4.
 # Собирает ту же карточку, что показывает приложение: градиентный фон,
@@ -18,6 +18,13 @@
 # плитку, нижний ряд включён) — в 1.4.5 низ плитки оставался пустым.
 # 1.4.9: команда .giftest — проверка на трёх печеньках: узор по третям,
 # габарит модели, живая ли анимация, плюс скриншот кадра в чат.
+# 1.4.27: свой текст больше не дублируется. Раньше он всегда шёл и в кадр,
+# и в подпись к файлу. Теперь два отдельных переключателя: card_caption
+# (текст на карточке, по умолчанию да) и file_caption (подпись к файлу в
+# чате, по умолчанию нет) — любой можно выключить в .cfg GiftGif.
+# Размеры: 1000 КБ больше не висит как «1000 КБ», а округляется в «1.0 МБ».
+# Кеш гифки помнит расширение файла: повторный .gif отдавался как gift.animation
+# и уходил документом, без автоплея.
 # 1.4.26: подпись. Прямой sendMedia не знал parse_mode — в чате было видно
 # «<b>gift.mp4</b>»; теперь HTML разбирается в text+entities, значит в подписи
 # работают жирный, код и премиум-эмодзи. Своя подпись через .gifttext
@@ -141,7 +148,7 @@ except Exception:  # pragma: no cover
     loader = utils = None
 
 
-MODULE_VERSION = "1.4.26"
+MODULE_VERSION = "1.4.27"
 
 INT64_MAX = 0x7FFFFFFFFFFFFFFF       # random_id в MTProto — знаковый int64
 
@@ -164,7 +171,8 @@ def human_size(path: str) -> str:
         size = os.path.getsize(path)
     except OSError:
         return "—"
-    if size >= 1024 * 1024:
+    # 1000 КБ выглядит как «ещё килобайты»: переводим в МБ чуть раньше
+    if size >= 950 * 1024:
         return "{:.1f} МБ".format(size / (1024 * 1024))
     return "{:.0f} КБ".format(size / 1024)
 
@@ -2091,7 +2099,9 @@ GIFHELP_TEXT = """
 <code>fps</code> — 30 легче, 60 как в приложении
 <code>pattern</code> — яркость узора в процентах (100 — как в приложении)
 <code>footer</code> — показывать название и номер
-<code>caption</code> — своя подпись, та же, что ставит <code>.gifttext</code>
+<code>caption</code> — свой текст, его же ставит <code>.gifttext</code>
+<code>card_caption</code> — рисовать этот текст на карточке (по умолчанию да)
+<code>file_caption</code> — подпись к файлу в чате (по умолчанию нет)
 <code>cache_minutes</code> — сколько держать готовую карточку в памяти
 
 {lamp:} <b>Мелочи, которые помогают</b>
@@ -2165,6 +2175,18 @@ class GiftGif(loader.Module):
                 validator=loader.validators.String(),
             ),
             loader.ConfigValue(
+                "card_caption", True,
+                "Рисовать свой текст на самой карточке (в кадре). "
+                "Выключить, если подпись нужна только в чате",
+                validator=loader.validators.Boolean(),
+            ),
+            loader.ConfigValue(
+                "file_caption", False,
+                "Подпись к файлу в чате (🎁 gift.mp4 · 1024 px · 1.0 МБ). "
+                "Вместе с card_caption даёт текст и на карточке, и под файлом",
+                validator=loader.validators.Boolean(),
+            ),
+            loader.ConfigValue(
                 "cache_minutes", 30,
                 "Сколько минут держать готовую карточку подарка в памяти "
                 "(0 — не кешировать)",
@@ -2225,7 +2247,7 @@ class GiftGif(loader.Module):
                 "<b>Помощь:</b> <code>.gifhelp</code> · "
                 "<b>Проверка:</b> <code>.giftest</code>\n"
                 "<b>Пачка:</b> {} карточек или сетка {} плиток\n"
-                "<b>Сейчас подписано:</b> {}\n"
+                "<b>Сейчас подписано:</b> {} · на карточке: {} · под файлом: {}\n"
                 "<b>Узор:</b> {} % от яркости приложения\n"
                 "<b>Версия:</b> <code>{}</code>"
                 "{}").format(
@@ -2235,6 +2257,8 @@ class GiftGif(loader.Module):
                     "✅" if have_ffmpeg else "❌ нет",
                     MAX_BATCH, MAX_TILES,
                     esc(str(self.get("caption", "") or "")) or "—",
+                    "да" if self.config["card_caption"] else "нет",
+                    "да" if self.config["file_caption"] else "нет",
                     self.config["pattern"], MODULE_VERSION, size_note)
 
     # ---------- вход: что именно рендерить ----------
@@ -2331,12 +2355,20 @@ class GiftGif(loader.Module):
                 message, f"❌ Слишком длинно ({len(raw)} символов, максимум 200)."
                 )
         self.set("caption", raw)
+        on_card = bool(self.config["card_caption"])
+        in_file = bool(self.config["file_caption"])
+        where = ("на карточке и под файлом" if on_card and in_file else
+                 "на карточке" if on_card else
+                 "под файлом" if in_file else
+                 "нигде — оба показателя выключены (card_caption, file_caption)")
         return await self.say(
             # подсказку про {fire:} не пропускаем через emoji(): иначе
             # фигурные скобки превратятся в анимированный эмодзи вместо текста
-            message, "✅ Подпись сохранена:\n<b>" + esc(raw) + "</b>\n\n"
-                     "Она появится на всех следующих карточках. Убрать: "
-                     "<code>.gifttext убрать</code>\n"
+            message, "✅ Текст сохранён:\n<b>" + esc(raw) + "</b>\n\n"
+                     "Куда он попадёт: " + where + "\n"
+                     "Меняется в <code>.cfg GiftGif</code>: "
+                     "<code>card_caption</code>, <code>file_caption</code>\n"
+                     "Убрать: <code>.gifttext убрать</code>\n"
                      "💡 Премиум-эмодзи: <code>.gifttext {fire:} текст</code>"
             )
 
@@ -2560,7 +2592,16 @@ class GiftGif(loader.Module):
 
     # ---------- пачка подарков ----------
 
+    def _card_text(self) -> str:
+        """Своя подпись для карточки; card_caption=False убирает её из кадра."""
+        if not self.config["card_caption"]:
+            return ""
+        return str(self.get("caption", "") or "")
+
     def _base_caption(self, detail: str) -> str:
+        """Подпись к файлу в чате; выключается настройкой file_caption."""
+        if not self.config["file_caption"]:
+            return ""
         own = str(self.get("caption", "") or "")
         return (emoji(esc(own)) + "\n" if own else "") + emoji(detail)
 
@@ -2820,7 +2861,7 @@ class GiftGif(loader.Module):
         folder = tempfile.mkdtemp(prefix="giftgif-")
         # "animation" — не суффикс файла: save_animation сам даст .mp4
         path = os.path.join(folder, "grid." + (fmt if fmt == "gif" else "mp4"))
-        caption = str(self.get("caption", "") or "")
+        caption = self._card_text()
         skipped: list = []
         try:
             async with self._render_lock:
@@ -2855,16 +2896,21 @@ class GiftGif(loader.Module):
             PATTERN_BOOST = 1.00
         fmt = normalize_fmt(fmt, "mp4")
         fps = int(self.config["fps"]) if fps is None else fps
-        caption = str(self.get("caption", "") or "")
+        caption = self._card_text()
         footer = bool(self.config["footer"])
+        # в ключе всё, что влияет на кадр: иначе после смены настроек
+        # отдавалась карточка из кеша, собранная по старым значениям
         key = (resolve_slug(raw), size, fps, fmt, caption, footer,
-               self.config["pattern"])
+               self.config["pattern"], bool(self.config["card_caption"]))
         if data_dir is None:
             self._purge_cache()
             hit = self._cache.get(key)
             if hit is not None:
                 folder = tempfile.mkdtemp(prefix="giftgif-")
-                path = os.path.join(folder, "gift." + fmt)
+                # расширение берём из кеша: у формата «animation» файл на диске
+                # gift.mp4, и путь gift.animation уводил доставку в send_file —
+                # то есть .gif из кеша приходил документом, без автоплея
+                path = os.path.join(folder, "gift." + hit[2])
                 try:
                     with open(path, "wb") as handle:
                         handle.write(hit[1])
@@ -2896,7 +2942,7 @@ class GiftGif(loader.Module):
         except Exception:
             limit = 0
         now = time.time()
-        for key, (made_at, blob) in list(self._cache.items()):
+        for key, (made_at, blob, _ext) in list(self._cache.items()):
             if limit <= 0 or now - made_at > limit:
                 self._cache.pop(key, None)
 
@@ -2916,7 +2962,8 @@ class GiftGif(loader.Module):
             return
         with open(path, "rb") as handle:
             blob = handle.read()
-        self._cache[key] = (time.time(), blob)
+        ext = os.path.basename(path).rsplit(".", 1)[-1].lower() or "mp4"
+        self._cache[key] = (time.time(), blob, ext)
         # и общий лимит по памяти: иначе 10 подарков по 33 МБ = OOM
         while len(self._cache) > 1 and sum(
                 len(item[1]) for item in self._cache.values()) > CACHE_MAX_TOTAL:
