@@ -1,7 +1,7 @@
 # ◇━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━◇
 # meta developer: @n3post
 # scope: Heroku, Hikka
-# version: 1.4.15
+# version: 1.4.16
 # author: n3
 # Description: Подарок Telegram → анимированная карточка GIF или MP4.
 # Собирает ту же карточку, что показывает приложение: градиентный фон,
@@ -18,6 +18,10 @@
 # плитку, нижний ряд включён) — в 1.4.5 низ плитки оставался пустым.
 # 1.4.9: команда .giftest — проверка на трёх печеньках: узор по третям,
 # габарит модели, живая ли анимация, плюс скриншот кадра в чат.
+# 1.4.16: gif снова гифка, а не файл. hikkatl в get_attributes не ставит
+# DocumentAttributeAnimated, поэтому Telegram показывал .gif документом
+# (стрелка «скачать», без автоплея). Теперь атрибуты анимации передаются
+# явно; mp4 не тронут.
 # 1.4.15: отправка починена по исходникам Hikka: файл с подписью идёт
 # через utils.answer_file / send_file, а не message.respond(file=…,
 # caption=…) — тот путь уходит в send_message и падал с «unexpected
@@ -2338,41 +2342,69 @@ class GiftGif(loader.Module):
         return (esc(own) + "\n" if own else "") + detail
 
     @staticmethod
+    def _gif_attributes(path: str):
+        """Атрибуты, которые превращают .gif в гифку Telegram, а не в файл.
+
+        hikkatl в get_attributes не ставит DocumentAttributeAnimated (он
+        появляется только при пересылке готового документа), поэтому .gif
+        уходил документом — со стрелкой «скачать» и без автоплея. Telegram
+        рисует гифку, когда у документа есть Animated. Берём настоящие
+        классы из hikkatl, а не самодельные.
+        """
+        try:
+            from hikkatl.tl import types as tl
+            return [tl.DocumentAttributeAnimated(),
+                    tl.DocumentAttributeFilename(os.path.basename(path))]
+        except Exception:                              # noqa: BLE001
+            return None
+
+    @staticmethod
+    async def _upload(message, path: str, caption: str = None,
+                      attributes=None) -> None:
+        """Отправка файла с подписью; если клиент не принял — без подписи.
+
+        Откаты идут по одному признаку за раз: сначала без подписи (старые
+        сборки), потом без атрибутов (клиент не знает про attributes).
+        """
+        extra = {"attributes": attributes} if attributes else {}
+        try:
+            await message.client.send_file(
+                message.chat_id, path, caption=caption, parse_mode="html",
+                supports_streaming=True, force_document=False, **extra)
+            return
+        except TypeError:
+            pass
+        try:
+            await message.client.send_file(
+                message.chat_id, path, supports_streaming=True,
+                force_document=False, **extra)
+        except TypeError:
+            await message.client.send_file(
+                message.chat_id, path, supports_streaming=True,
+                force_document=False)
+        if caption:
+            with contextlib.suppress(Exception):
+                await utils.answer(message, caption, parse_mode="html")
+
+    @staticmethod
     async def _deliver(message, path: str, caption: str) -> None:
         """Отправить готовый файл так, как это работает в Hikka.
 
-        `message.respond(file=…, caption=…)` на файле уходит не в send_file,
-        а в send_message — отсюда «unexpected keyword argument 'caption'».
-        Поэтому: mp4 — send_file напрямую (играет как видео), gif — через
-        utils.answer_file. Если клиент не принял подпись к видео, шлём видео
-        без неё, а подпись отдельным сообщением: файл важнее подписи.
+        `message.respond(file=…, caption=…)` уходит не в send_file, а в
+        send_message — отсюда «unexpected keyword argument 'caption'».
+        Поэтому файл идёт через send_file: mp4 — как видео (играет в чате),
+        gif — с DocumentAttributeAnimated, иначе Telegram показывает его
+        документом со стрелкой «скачать», а не гифкой.
         """
-        video = path.lower().endswith(".mp4")
-        if video:
-            try:
-                await message.client.send_file(
-                    message.chat_id, path, caption=caption, parse_mode="html",
-                    supports_streaming=True, force_document=False)
-                return
-            except Exception:                          # noqa: BLE001
-                await message.client.send_file(
-                    message.chat_id, path, supports_streaming=True,
-                    force_document=False)
-                with contextlib.suppress(Exception):
-                    await utils.answer(message, caption, parse_mode="html")
-                return
-        # gif: отправляем как документ-гифку без подписи, подпись — отдельным
-        # сообщением. Так не зависим от того, пускает ли клиент caption в
-        # send_file (у части сборок тут и падало «unexpected keyword
-        # argument 'caption'»), и не теряем файл.
+        if path.lower().endswith(".mp4"):
+            await GiftGif._upload(message, path, caption)
+            return
+        attributes = GiftGif._gif_attributes(path)
         try:
-            await message.client.send_file(message.chat_id, path,
-                                           force_document=False)
+            await GiftGif._upload(message, path, caption, attributes)
         except Exception:                              # noqa: BLE001
-            await message.client.send_file(message.chat_id, path,
-                                           force_document=True)
-        with contextlib.suppress(Exception):
-            await utils.answer(message, caption, parse_mode="html")
+            # атрибуты не приняли — лучше файл, чем ничего
+            await GiftGif._upload(message, path, caption)
 
     async def _send_file(self, message, path: str) -> None:
         """Видео — как видео (играет в чате), GIF — как GIF."""
