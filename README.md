@@ -6,11 +6,11 @@ MP4 или GIF, 40–60 fps, ~3 секунды.
 
 ## Установка
 
-.dlmod https://raw.githubusercontent.com/Motikpotik/giftgif/main/giftgif.py
+.dlmod https://raw.githubusercontent.com/Motikpotik/gif/main/giftgif.py
 
 или как репозиторий:
 
-.addrepo https://raw.githubusercontent.com/Motikpotik/giftgif/main
+.addrepo https://raw.githubusercontent.com/Motikpotik/gif/main
 .dlmod giftgif
 
 Зависимости: rlottie-python Pillow pilmoji imageio-ffmpeg>=0.5,<0.8
