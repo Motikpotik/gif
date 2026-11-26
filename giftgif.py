@@ -1,7 +1,7 @@
 # ◇━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━◇
 # meta developer: @n3post
 # scope: Heroku, Hikka
-# version: 1.4.20
+# version: 1.4.21
 # author: n3
 # Description: Подарок Telegram → анимированная карточка GIF или MP4.
 # Собирает ту же карточку, что показывает приложение: градиентный фон,
@@ -18,6 +18,9 @@
 # плитку, нижний ряд включён) — в 1.4.5 низ плитки оставался пустым.
 # 1.4.9: команда .giftest — проверка на трёх печеньках: узор по третям,
 # габарит модели, живая ли анимация, плюс скриншот кадра в чат.
+# 1.4.21: у гифки нет звуковой дорожки вообще (-an): даже пустая дорожка
+# делает из неё обычное видео. Новая команда .gifdiag — показывает, каким
+# путём ушёл файл, что сохранил сервер и что видит клиент, вместо догадок.
 # 1.4.20: гифка уходит прямым запросом messages.sendMedia, а не через
 # send_file: раньше DocumentAttributeAnimated до сервера не доходил, и любой
 # mp4 показывался видео с таймером (все правки 1.4.16–1.4.19 лечили симптомы).
@@ -1791,6 +1794,10 @@ def save_mp4(frames, fps: int, path: str, crf: int = 16,
     ]
     if not animation:
         command += ["-c:a", "aac", "-b:a", "8k", "-ac", "1", "-ar", "22050"]
+    if animation:
+        # у гифки Telegram звуковой дорожки нет вообще: пустая (anullsrc)
+        # тоже не годится — с ней сервер видит обычное видео
+        command += ["-an"]
     command += ["-movflags", "+faststart", path]
 
     # A file avoids stderr-pipe deadlock. Always reap the child on failure.
@@ -2312,6 +2319,52 @@ class GiftGif(loader.Module):
             await self.say(message, report)
         finally:
             shutil.rmtree(folder, ignore_errors=True)
+
+    @loader.command()
+    async def gifdiag(self, message):
+        """| диагностика: какой путь отправки и что вернул сервер"""
+        await self.say(message, "🔬 Проверяю отправку гифки…")
+        folder = tempfile.mkdtemp(prefix="giftgif-")
+        path = os.path.join(folder, "diag.mp4")
+        lines = ["<b>GiftGif — диагностика</b>"]
+        try:
+            async with self._render_lock:
+                made = await asyncio.get_running_loop().run_in_executor(
+                    None, lambda: save_animation(
+                        frame_stream(*load_assets(SELFTEST_REFS[0])[:3],
+                                     size=256, fps=30), 30, "animation", path))
+            width, height, duration = GiftGif._video_meta(made)
+            lines.append("• файл: {}×{}, {:.1f} c".format(width or "?", height or "?", duration))
+            # 1) сообщение, отправленное прямым путём
+            sent = await GiftGif._send_animation(message, made, "🔬 diag")
+            if sent is None:
+                lines.append("❌ прямой <code>sendMedia</code> НЕ прошёл → резерв")
+            else:
+                attrs = GiftGif._sent_attributes_sync(sent)
+                lines.append("✅ путь: <code>messages.sendMedia</code>")
+                lines.append("• сервер сохранил: <code>{}</code>".format(", ".join(attrs) or "—"))
+                lines.append("• <b>Animated {}</b>".format(
+                    "есть" if "DocumentAttributeAnimated" in attrs else "НЕТ"))
+            # 2) что клиент видит у последнего сообщения в чате
+            try:
+                # без chat_id — «Избранное»: не важно, куда смотреть
+                last = (await message.client.get_messages(message.chat_id, limit=1))[0]
+                attrs = [type(a).__name__ for a in
+                         (last.media.document.attributes if last.media else [])]
+                lines.append("• клиент видит: <code>{}</code>".format(
+                    ", ".join(attrs) or "нет документа"))
+            except Exception as exc:                   # noqa: BLE001
+                lines.append("• клиентский просмотр не удался: <code>{}</code>".format(
+                    esc(type(exc).__name__)))
+            lines.append("")
+            lines.append("<i>Сервер и клиент — разные вещи: если сервер отдал "
+                         "Animated, а в чате видео, это кеш клиента или "
+                         "классификация на его стороне.</i>")
+        except Exception as exc:                       # noqa: BLE001
+            lines.append("❌ ошибка: <code>{}</code>".format(esc(exc)))
+        finally:
+            shutil.rmtree(folder, ignore_errors=True)
+        await self.say(message, "\n".join(lines))
 
     @loader.command()
     async def gifhelp(self, message):
