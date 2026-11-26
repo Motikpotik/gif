@@ -1,7 +1,7 @@
 # ◇━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━◇
 # meta developer: @n3post
 # scope: Heroku, Hikka
-# version: 1.4.14
+# version: 1.4.15
 # author: n3
 # Description: Подарок Telegram → анимированная карточка GIF или MP4.
 # Собирает ту же карточку, что показывает приложение: градиентный фон,
@@ -18,6 +18,15 @@
 # плитку, нижний ряд включён) — в 1.4.5 низ плитки оставался пустым.
 # 1.4.9: команда .giftest — проверка на трёх печеньках: узор по третям,
 # габарит модели, живая ли анимация, плюс скриншот кадра в чат.
+# 1.4.15: отправка починена по исходникам Hikka: файл с подписью идёт
+# через utils.answer_file / send_file, а не message.respond(file=…,
+# caption=…) — тот путь уходит в send_message и падал с «unexpected
+# keyword argument 'caption'». Если клиент не принимает подпись к видео,
+# видео уходит без неё, подпись — отдельным сообщением.
+# Кадр больше не тянет фиксированную высоту ASPECT: обрезается по низу
+# фактической подписи, пустой полосы под коротким названием нет.
+# Кеш готовых карточек ограничен по памяти (файл 12 МБ, всего 48 МБ).
+# say() при повторе без разметки больше не срезает теги эмодзи в пустоту.
 # 1.4.14: в справке команда проверки называлась .gifтест — опечатка,
 # теперь .giftest. У эмодзи shield document_id был из 16 цифр (у остальных
 # 19) — id не подтверждён, поэтому оставлен обычный символ 🛡: иначе
@@ -56,6 +65,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import contextlib
 import zlib
 import gzip
 import io
@@ -1417,6 +1427,31 @@ def footer_height(tile_side: int, card: Card) -> int:
         int(tile_side * CAPTION_CAP * 1.45) * max(0, lines - 1)
 
 
+def footer_bottom(card: Card, tile_side: int, tile_y: int,
+                  canvas: Image.Image) -> int:
+    """Низ подписи по фактически нарисованным строкам (для обрезки кадра).
+
+    Одиночная карточка больше не тянет фиксированную высоту ASPECT: если
+    строк меньше, кадр режется ровно по низу последней, с тем же зазором
+    NAME_GAP, что и под плиткой.
+    """
+    gap = int(tile_side * NAME_GAP)
+    styles = []
+    if card.name or card.number:
+        styles.append((NAME_CAP, True))          # имя + номер
+    if card.author:
+        styles.append((AUTHOR_CAP, False))
+    if card.caption:
+        styles.append((CAPTION_CAP, False))
+    if not styles:
+        return canvas.height
+    bottom = tile_y + tile_side
+    for index, (cap, _first) in enumerate(styles):
+        bottom += int(tile_side * 0.034) if index else gap
+        bottom += int(tile_side * cap / CAP_TO_SIZE.get("regular", 0.711))
+    return min(canvas.height, bottom + gap // 2)
+
+
 def draw_footer(card: Card, canvas: Image.Image, tile_side: int,
                 tile_y: int, tile_x: int | None = None) -> Image.Image:
     """Название, номер, автор и свой текст под плиткой — один раз на кадр.
@@ -1582,8 +1617,14 @@ def frame_stream(card: Card, lottie_bytes: bytes, pattern, size: int = 512,
     if footer:
         bake = Image.new("RGB", base.size, PAGE_BG)
         draw_footer(card, bake, tile_side, tile_y)
-        band = (0, max(0, tile_y + tile_side), base.width, base.height)
+        band_top = max(0, tile_y + tile_side)
+        band = (0, band_top, base.width, footer_bottom(card, tile_side, tile_y, base))
         footer_layer = bake.crop(band)
+        # Кадр обрезается по фактическому низу подписи: раньше высота была
+        # фиксированной (ASPECT), и под коротким названием оставалась
+        # широкая пустая полоса — на глаз «странное место снизу».
+        if band[3] < base.height:
+            base = base.crop((0, 0, base.width, band[3]))
     else:
         band = footer_layer = None
 
@@ -1772,6 +1813,11 @@ def load_assets(raw: str, data_dir: str | None = None):
 # Вшитый силуэт — только запасной вариант, если CDN не ответил.
 _PATTERN_CACHE: dict[str, bytes] = {}
 PATTERN_CACHE_LIMIT = 32
+# Кеш готовых карточек в памяти: mp4 ~1 МБ, gif на 1024/60 ~33 МБ.
+# Без лимитов 10 разных подарков подряд = сотни мегабайт и OOM
+# на слабом хостинге, поэтому есть границы на файл и на всё разом.
+CACHE_MAX_FILE = 12 * 1024 * 1024      # 12 МБ на одну карточку
+CACHE_MAX_TOTAL = 48 * 1024 * 1024     # 48 МБ на весь кеш
 
 
 def load_pattern(card: Card) -> Image.Image | None:
@@ -2011,7 +2057,12 @@ class GiftGif(loader.Module):
         try:
             await utils.answer(message, text, parse_mode="html")
         except Exception:
-            await utils.answer(message, re.sub(r"<[^>]+>", "", text))
+            # Повтор без parse_mode: Telegram покажет премиум-эмодзи по
+            # document_id. Раньше здесь срезались ВСЕ теги — оставался пустой
+            # 🛡/◻️ вместо иконки, потому что глифа внутри тега нет.
+            plain = re.sub(r"<emoji document_id=\d+>([^<]*)</emoji>", r"\1", text)
+            plain = re.sub(r"<[^>]+>", "", plain)
+            await utils.answer(message, plain)
 
     def status(self) -> str:
         import importlib.util
@@ -2266,15 +2317,8 @@ class GiftGif(loader.Module):
             f"🎁 <b>{esc(os.path.basename(path))}</b> · {size} px · "
             f"{os.path.getsize(path) / 1024:.0f} КБ")
         try:
-            if path.lower().endswith(".mp4"):
-                # видео отправляем как видео: играет прямо в чате, без «файла»
-                await message.client.send_file(
-                    message.chat_id, path, caption=caption,
-                    parse_mode="html", supports_streaming=True,
-                    force_document=False)
-            else:
-                await message.respond(file=path, caption=caption,
-                                      parse_mode="html", force_document=False)
+            # видео — как видео (играет в чате), gif — через answer_file
+            await self._deliver(message, path, caption)
         except Exception as exc:                       # noqa: BLE001
             await self.say(message, f"❌ Отправка не удалась: <code>{esc(exc)}</code>"
                            )
@@ -2293,18 +2337,48 @@ class GiftGif(loader.Module):
         own = str(self.get("caption", "") or "")
         return (esc(own) + "\n" if own else "") + detail
 
+    @staticmethod
+    async def _deliver(message, path: str, caption: str) -> None:
+        """Отправить готовый файл так, как это работает в Hikka.
+
+        `message.respond(file=…, caption=…)` на файле уходит не в send_file,
+        а в send_message — отсюда «unexpected keyword argument 'caption'».
+        Поэтому: mp4 — send_file напрямую (играет как видео), gif — через
+        utils.answer_file. Если клиент не принял подпись к видео, шлём видео
+        без неё, а подпись отдельным сообщением: файл важнее подписи.
+        """
+        video = path.lower().endswith(".mp4")
+        if video:
+            try:
+                await message.client.send_file(
+                    message.chat_id, path, caption=caption, parse_mode="html",
+                    supports_streaming=True, force_document=False)
+                return
+            except Exception:                          # noqa: BLE001
+                await message.client.send_file(
+                    message.chat_id, path, supports_streaming=True,
+                    force_document=False)
+                with contextlib.suppress(Exception):
+                    await utils.answer(message, caption, parse_mode="html")
+                return
+        # gif: отправляем как документ-гифку без подписи, подпись — отдельным
+        # сообщением. Так не зависим от того, пускает ли клиент caption в
+        # send_file (у части сборок тут и падало «unexpected keyword
+        # argument 'caption'»), и не теряем файл.
+        try:
+            await message.client.send_file(message.chat_id, path,
+                                           force_document=False)
+        except Exception:                              # noqa: BLE001
+            await message.client.send_file(message.chat_id, path,
+                                           force_document=True)
+        with contextlib.suppress(Exception):
+            await utils.answer(message, caption, parse_mode="html")
+
     async def _send_file(self, message, path: str) -> None:
         """Видео — как видео (играет в чате), GIF — как GIF."""
-        caption = self._base_caption(
+        await self._deliver(message, path, self._base_caption(
             f"🎁 <b>{esc(os.path.basename(path))}</b> · "
-            f"{os.path.getsize(path) / 1024:.0f} КБ")
-        if path.lower().endswith(".mp4"):
-            await message.client.send_file(
-                message.chat_id, path, caption=caption, parse_mode="html",
-                supports_streaming=True, force_document=False)
-        else:
-            await message.respond(file=path, caption=caption,
-                                  parse_mode="html", force_document=False)
+            f"{os.path.getsize(path) / 1024:.0f} КБ"))
 
     async def _send_batch(self, message, refs: list, *, size: int, fmt: str) -> None:
         """Пачка: по карточке на подарок, отправляются по очереди."""
@@ -2444,5 +2518,17 @@ class GiftGif(loader.Module):
             limit = 0
         if limit <= 0:
             return
+        try:                       # один mp4 ≈ 1 МБ, gif на 1024/60 ≈ 33 МБ
+            too_big = os.path.getsize(path) > CACHE_MAX_FILE
+        except OSError:
+            return
+        if too_big:                # тяжелее лимита на файл — не держим в памяти
+            return
         with open(path, "rb") as handle:
-            self._cache[key] = (time.time(), handle.read())
+            blob = handle.read()
+        self._cache[key] = (time.time(), blob)
+        # и общий лимит по памяти: иначе 10 подарков по 33 МБ = OOM
+        while len(self._cache) > 1 and sum(
+                len(item[1]) for item in self._cache.values()) > CACHE_MAX_TOTAL:
+            oldest = min(self._cache.items(), key=lambda item: item[1][0])[0]
+            self._cache.pop(oldest, None)
