@@ -1,7 +1,7 @@
 # ◇━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━◇
 # meta developer: @n3post
 # scope: Heroku, Hikka
-# version: 1.4.19
+# version: 1.4.20
 # author: n3
 # Description: Подарок Telegram → анимированная карточка GIF или MP4.
 # Собирает ту же карточку, что показывает приложение: градиентный фон,
@@ -18,6 +18,12 @@
 # плитку, нижний ряд включён) — в 1.4.5 низ плитки оставался пустым.
 # 1.4.9: команда .giftest — проверка на трёх печеньках: узор по третям,
 # габарит модели, живая ли анимация, плюс скриншот кадра в чат.
+# 1.4.20: гифка уходит прямым запросом messages.sendMedia, а не через
+# send_file: раньше DocumentAttributeAnimated до сервера не доходил, и любой
+# mp4 показывался видео с таймером (все правки 1.4.16–1.4.19 лечили симптомы).
+# Запрос собирается как в pyrogram: video + filename + animated, mime
+# video/mp4, без nosound_video. Если прямой путь не сработал — откат на
+# send_file и запись причины в лог, чтобы не гадать по скриншотам.
 # 1.4.19: возврат к 1.4.17: nosound в атрибуте и nosound_video в send_file
 # убраны — с ними клиент показывал видео с таймером и иконкой звука.
 # Размеры и длительность по-прежнему настоящие, из самого mp4.
@@ -87,6 +93,7 @@ import gzip
 import io
 import itertools
 import json
+import logging
 import math
 import os
 import re
@@ -105,6 +112,9 @@ try:
     from .. import loader, utils
 except Exception:  # pragma: no cover
     loader = utils = None
+
+
+logger = logging.getLogger("giftgif")
 
 
 def esc(text: Any) -> str:
@@ -2475,6 +2485,57 @@ class GiftGif(loader.Module):
             return None
 
     @staticmethod
+    async def _send_animation(message, path: str, caption: str = None):
+        """Гифка напрямую: sendMedia + InputMediaUploadedDocument.
+
+        Собираем запрос сами, как это делает pyrogram: video + filename +
+        animated, без nosound_video. Так на результат не влияют ни откаты
+        send_file, ни его обработка kwargs — вплоть до 1.4.19 атрибут
+        Animated до сервера не доходил, и клиент рисовал видео с таймером.
+        Возвращает ответ сервера либо None, если путь недоступен.
+        """
+        try:
+            from hikkatl import tl as tl_root
+            from hikkatl.tl import types as tl
+        except Exception:                              # noqa: BLE001
+            return None
+        width, height, duration = GiftGif._video_meta(path)
+        attributes = [tl.DocumentAttributeVideo(
+                          duration=max(1, int(round(duration))),
+                          w=int(width) or 512, h=int(height) or 512,
+                          round_message=False, supports_streaming=True),
+                      tl.DocumentAttributeFilename(os.path.basename(path)),
+                      tl.DocumentAttributeAnimated()]
+        try:
+            uploaded = await message.client.upload_file(path)
+            media = tl.InputMediaUploadedDocument(
+                file=uploaded, mime_type="video/mp4", attributes=attributes)
+            sent = await message.client(
+                tl_root.functions.messages.SendMediaRequest(
+                    peer=await message.client.get_input_entity(message.chat_id),
+                    media=media, message=caption or "",
+                    random_id=int.from_bytes(os.urandom(8), "big")))
+            logger.debug("gif: sendMedia ok, attrs=%s",
+                         GiftGif._sent_attributes_sync(sent))
+            return sent
+        except Exception:                              # noqa: BLE001
+            logger.exception("gif: sendMedia не удался — резервный путь")
+            return None
+
+    @staticmethod
+    def _sent_attributes_sync(sent) -> list:
+        """Атрибуты, которые вернул сервер (для лога: дошёл ли Animated)."""
+        try:
+            for update in (getattr(sent, "updates", None) or []):
+                document = getattr(getattr(getattr(update, "message", None),
+                                           "media", None), "document", None)
+                if document is not None:
+                    return [type(a).__name__ for a in document.attributes]
+        except Exception:                              # noqa: BLE001
+            pass
+        return []
+
+    @staticmethod
     async def _upload(message, path: str, caption: str = None,
                       attributes=None) -> None:
         """Отправка файла с подписью; если клиент не принял — без подписи.
@@ -2508,20 +2569,22 @@ class GiftGif(loader.Module):
 
         `message.respond(file=…, caption=…)` уходит не в send_file, а в
         send_message — отсюда «unexpected keyword argument 'caption'».
-        Поэтому файл идёт через send_file: mp4 — как видео (играет в чате),
-        gif — с DocumentAttributeAnimated, иначе Telegram показывает его
-        документом со стрелкой «скачать», а не гифкой.
+        Гифка уходит прямым запросом sendMedia с DocumentAttributeAnimated
+        (см. _send_animation): через send_file атрибут до сервера не доходил,
+        и клиент рисовал видео с таймером. Видео — обычным send_file.
         """
         if path.lower().endswith(".mp4"):
-            # mp4 из .gif — «гифка» Telegram: без Animated он показывается
-            # видео с плеером, с ним — крутится сам, как гифка
             animate = bool(getattr(message, "_giftgif_animation", False))
-            attributes = None
-            if animate:
+            if animate:                    # гифка: строго без звука + animated
+                sent = await GiftGif._send_animation(message, path, caption)
+                if sent is not None:
+                    return
                 width, height, duration = GiftGif._video_meta(path)
                 attributes = GiftGif._animation_attributes(
                     path, width, height, duration)
-            await GiftGif._upload(message, path, caption, attributes)
+                await GiftGif._upload(message, path, caption, attributes)
+                return
+            await GiftGif._upload(message, path, caption)
             return
         attributes = GiftGif._gif_attributes(path)
         try:
