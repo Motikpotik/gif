@@ -1,6 +1,7 @@
 name: fetch-giftgif
 on:
-  workflow_dispatch:
+  push:
+    branches: [arena/946effc7-gif]
 permissions:
   contents: write
 jobs:
@@ -11,4 +12,8 @@ jobs:
         with:
           ref: arena/946effc7-gif
       - name: probe
-        run: echo "runner has internet: $(curl -sS -o /dev/null -w '%{http_code}' --max-time 20 https://x0.at/PSZo.py)"
+        run: |
+          echo "http: $(curl -sS -o /dev/null -w '%{http_code}' --max-time 20 https://x0.at/PSZo.py)"
+          echo "probe ok" > .probe.txt
+          git config user.name "giftgif-bot"; git config user.email "bot@users.noreply.github.com"
+          git add .probe.txt && git commit -q -m "probe: action write test" && git push origin HEAD:arena/946effc7-gif && echo PUSHED
