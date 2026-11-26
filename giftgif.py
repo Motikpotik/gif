@@ -1,7 +1,7 @@
 # ◇━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━◇
 # meta developer: @n3post
 # scope: Heroku, Hikka
-# version: 1.4.17
+# version: 1.4.18
 # author: n3
 # Description: Подарок Telegram → анимированная карточка GIF или MP4.
 # Собирает ту же карточку, что показывает приложение: градиентный фон,
@@ -18,6 +18,10 @@
 # плитку, нижний ряд включён) — в 1.4.5 низ плитки оставался пустым.
 # 1.4.9: команда .giftest — проверка на трёх печеньках: узор по третям,
 # габарит модели, живая ли анимация, плюс скриншот кадра в чат.
+# 1.4.18: плеер вместо гифки — не хватало флага nosound в
+# DocumentAttributeVideo: без него клиент считает mp4 обычным видео и рисует
+# кнопку play. Теперь nosound=True (+ nosound_video в send_file), а размеры и
+# длительность берутся из самого mp4, а не из догадки 512×512×3.
 # 1.4.17: .gif отдаётся как гифка Telegram — mp4 без звука с атрибутами
 # video+animated. Настоящий .gif iOS показывает файлом со стрелкой «скачать»
 # (баг клиента, bugs.telegram.org/c/577), а mp4-анимацию крутит сам.
@@ -2390,19 +2394,62 @@ class GiftGif(loader.Module):
         return (esc(own) + "\n" if own else "") + detail
 
     @staticmethod
-    def _animation_attributes(path: str, width: int = 512, height: int = 512,
-                              duration: int = 3):
-        """Атрибуты «гифки» Telegram: video + animated без звука.
+    def _video_meta(path: str, fps: int = 30) -> tuple:
+        """Настоящие ширина, высота и длительность mp4 (без ffprobe).
 
-        Так клиент рисует её как анимацию в чате и крутит сам — включая iOS,
-        который настоящий .gif показывает файлом. Порядок как у самого
-        Telegram: video, filename, animated.
+        Клиент рисует плеер вместо гифки, когда размеры в атрибутах не
+        совпадают с файлом, поэтому геометрию берём из самого видео.
+        """
+        width = height = 0
+        duration = 0.0
+        try:
+            with open(path, "rb") as handle:
+                head = handle.read(1 << 20)
+            # tkhd из moov: ширина и высота лежат в 4 последних байтах
+            for tag in (b"tkhd", b"mvhd"):
+                pos = head.find(tag)
+                if pos < 0:
+                    continue
+                start = pos + 4 + 4                 # version + flags
+                if head[start] == 1:                # 64-битные времена
+                    scale_at, dur_at, size_at = start + 16, start + 20, start + 84
+                else:
+                    scale_at, dur_at, size_at = start + 8, start + 12, start + 72
+                scale = int.from_bytes(head[scale_at:scale_at + 4], "big")
+                raw = int.from_bytes(head[dur_at:dur_at + 4], "big")
+                if tag == b"mvhd" and scale and not duration:
+                    duration = raw / scale
+                if tag == b"tkhd":
+                    width = int.from_bytes(head[size_at:size_at + 4], "big") >> 16
+                    height = int.from_bytes(head[size_at + 4:size_at + 8], "big") >> 16
+                if duration and width:
+                    break
+        except Exception:                              # noqa: BLE001
+            pass
+        if not (width and height):
+            width = height = 0                    # пусть клиент возьмёт из файла
+        if duration <= 0:
+            duration = 3.0
+        return width, height, duration
+
+    def _animation_attributes(path: str, width: int = 0, height: int = 0,
+                              duration: float = 3.0):
+        """Атрибуты «гифки» Telegram: video(nosound) + animated.
+
+        nosound — флаг из MTProto: «звука нет, это гифка». Без него клиент
+        рисует обычное видео с плеером (так и вышло в 1.4.17). Порядок как у
+        самого Telegram: video, filename, animated.
         """
         try:
             from hikkatl.tl import types as tl
+            # w/h обязательны в конструкторе; карточка почти квадратная,
+            # поэтому при неудачном разборе файла берём 512×512, а не теряем
+            # атрибуты (без них клиент снова нарисует плеер)
             return [tl.DocumentAttributeVideo(
-                        duration=duration, w=width, h=height,
-                        supports_streaming=True),
+                        duration=max(1, int(round(duration))),
+                        w=int(width) or 512, h=int(height) or 512,
+                        round_message=False, supports_streaming=True,
+                        nosound=True),
                     tl.DocumentAttributeFilename(os.path.basename(path)),
                     tl.DocumentAttributeAnimated()]
         except Exception:                              # noqa: BLE001
@@ -2437,7 +2484,8 @@ class GiftGif(loader.Module):
         try:
             await message.client.send_file(
                 message.chat_id, path, caption=caption, parse_mode="html",
-                supports_streaming=True, force_document=False, **extra)
+                supports_streaming=True, force_document=False,
+                nosound_video=True if attributes else None, **extra)
             return
         except TypeError:
             pass
@@ -2467,8 +2515,11 @@ class GiftGif(loader.Module):
             # mp4 из .gif — «гифка» Telegram: без Animated он показывается
             # видео с плеером, с ним — крутится сам, как гифка
             animate = bool(getattr(message, "_giftgif_animation", False))
-            attributes = (GiftGif._animation_attributes(path)
-                          if animate else None)
+            attributes = None
+            if animate:
+                width, height, duration = GiftGif._video_meta(path)
+                attributes = GiftGif._animation_attributes(
+                    path, width, height, duration)
             await GiftGif._upload(message, path, caption, attributes)
             return
         attributes = GiftGif._gif_attributes(path)
