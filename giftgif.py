@@ -1,7 +1,7 @@
 # ◇━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━◇
 # meta developer: @n3post
 # scope: Heroku, Hikka
-# version: 1.4.16
+# version: 1.4.17
 # author: n3
 # Description: Подарок Telegram → анимированная карточка GIF или MP4.
 # Собирает ту же карточку, что показывает приложение: градиентный фон,
@@ -18,6 +18,11 @@
 # плитку, нижний ряд включён) — в 1.4.5 низ плитки оставался пустым.
 # 1.4.9: команда .giftest — проверка на трёх печеньках: узор по третям,
 # габарит модели, живая ли анимация, плюс скриншот кадра в чат.
+# 1.4.17: .gif отдаётся как гифка Telegram — mp4 без звука с атрибутами
+# video+animated. Настоящий .gif iOS показывает файлом со стрелкой «скачать»
+# (баг клиента, bugs.telegram.org/c/577), а mp4-анимацию крутит сам.
+# Заодно: ffmpeg-ошибки больше не прячутся за «Broken pipe», сетка не теряет
+# имя файла (grid.animation → grid.mp4).
 # 1.4.16: gif снова гифка, а не файл. hikkatl в get_attributes не ставит
 # DocumentAttributeAnimated, поэтому Telegram показывал .gif документом
 # (стрелка «скачать», без автоплея). Теперь атрибуты анимации передаются
@@ -1731,11 +1736,16 @@ def save_gif(frames, fps: int, path: str) -> int:
     return os.path.getsize(path)
 
 
-def save_mp4(frames, fps: int, path: str, crf: int = 16) -> int:
+def save_mp4(frames, fps: int, path: str, crf: int = 16,
+             animation: bool = False) -> int:
     """MP4 через ffmpeg: кадры идут потоком, без 180 PNG на диске.
 
     Пайп вместо временной папки: сборка быстрее и не упирается в запись
     файлов на слабом хостинге.
+
+    animation=True — «гифка» Telegram: mp4 без звуковой дорожки. Именно так
+    ходят гифки в самом Telegram, и такой файл крутится сам в чате, в том
+    числе на iOS (там настоящий .gif показывается файлом со стрелкой).
     """
     frames = iter(frames)                 # список или генератор — оба годятся
     try:
@@ -1745,21 +1755,27 @@ def save_mp4(frames, fps: int, path: str, crf: int = 16) -> int:
     width, height = first.size
     width -= width % 2
     height -= height % 2
-    # Пустая звуковая дорожка: без неё Telegram показывает mp4 как GIF
-    # (значок GIF, маленькое превью), с ней — как обычное видео.
     command = [
         ffmpeg_bin(), "-y", "-loglevel", "error", "-filter_threads", "1",
         "-thread_queue_size", "1", "-f", "rawvideo", "-pix_fmt", "rgb24",
         "-s", "{}x{}".format(width, height), "-framerate", str(fps),
         "-i", "-",
-        "-f", "lavfi", "-i", "anullsrc=channel_layout=stereo:sample_rate=44100",
-        "-shortest",
+    ]
+    if not animation:
+        # Пустая звуковая дорожка: без неё Telegram показывает mp4 как GIF
+        # (значок GIF, маленькое превью), с ней — как обычное видео.
+        command += ["-f", "lavfi", "-i",
+                    "anullsrc=channel_layout=stereo:sample_rate=44100",
+                    "-shortest"]
+    command += [
         "-c:v", "libx264", "-pix_fmt", "yuv420p",
         "-crf", str(crf), "-preset", "medium", "-threads", "2",
         "-rc-lookahead", "6", "-refs", "2",
-        "-c:a", "aac", "-b:a", "8k", "-ac", "1", "-ar", "22050",
-        "-movflags", "+faststart", path,
     ]
+    if not animation:
+        command += ["-c:a", "aac", "-b:a", "8k", "-ac", "1", "-ar", "22050"]
+    command += ["-movflags", "+faststart", path]
+
     # A file avoids stderr-pipe deadlock. Always reap the child on failure.
     with tempfile.TemporaryFile() as errors:
         process = subprocess.Popen(command, stdin=subprocess.PIPE,
@@ -1768,7 +1784,14 @@ def save_mp4(frames, fps: int, path: str, crf: int = 16) -> int:
             for frame in itertools.chain([first], frames):
                 if frame.size != (width, height):
                     frame = frame.resize((width, height), Image.LANCZOS)
-                process.stdin.write(frame.convert("RGB").tobytes())
+                try:
+                    process.stdin.write(frame.convert("RGB").tobytes())
+                except (BrokenPipeError, ValueError):
+                    # ffmpeg упал раньше (неверные параметры, нет места на
+                    # диске) — показываем его сообщение, а не «Broken pipe»
+                    errors.seek(0)
+                    raise RuntimeError("ffmpeg: " + errors.read(2000).decode(
+                        "utf-8", "replace")) from None
             process.stdin.close()
             if process.wait() != 0:
                 errors.seek(0)
@@ -1845,15 +1868,35 @@ def load_pattern(card: Card) -> Image.Image | None:
         return embedded_silhouette()
 
 
+def _with_ext(path: str, ext: str) -> str:
+    """Сменить расширение, не теряя имя (см. ниже)."""
+    """`grid.animation` → `grid.mp4`.
+
+    Не Path.with_suffix: он считает суффиксом всё после последней точки,
+    поэтому «grid.animation» превращался в «1.mp4» (имя «grid» пропадало).
+    """
+    base = os.path.basename(str(path))
+    stem = base.rsplit(".", 1)[0] if "." in base else base
+    # «gift.mp4.animation» / «gift.gif.animation» → одно расширение
+    while "." in stem and stem.rsplit(".", 1)[1] in (
+            "mp4", "gif", "animation", "webm", "mkv"):
+        stem = stem.rsplit(".", 1)[0]
+    return os.path.join(os.path.dirname(str(path)) or ".", stem + ext)
+
+
 def save_animation(frames, fps: int, fmt: str, path: str) -> str:
     """Decide fallback BEFORE consuming the one-shot frame generator."""
-    if fmt == "mp4":
+    if fmt in ("mp4", "animation"):
         try:
             ffmpeg_bin()
         except RuntimeError:
-            path = str(Path(path).with_suffix(".gif"))
+            path = _with_ext(path, ".gif")
             fmt = "gif"
-    if fmt == "mp4":
+    if fmt == "animation":
+        # mp4 без звука; расширение принудительно, даже если путь уже .gif
+        path = _with_ext(path, ".mp4")
+        save_mp4(frames, fps, path, animation=True)
+    elif fmt == "mp4":
         save_mp4(frames, fps, path)
     else:
         save_gif(frames, fps, path)
@@ -2277,6 +2320,10 @@ class GiftGif(loader.Module):
         # поле «format» в конфиге заполняют руками: «mp4», «видео», «GIF» —
         # любое написание сводим к mp4/gif, иначе сравнение падало на регистре
         fmt = normalize_fmt(fmt or self.config["format"], "mp4")
+        # .gif собираем не настоящим .gif, а mp4-анимацией: iOS показывает
+        # .gif файлом со стрелкой «скачать», а mp4 с Animated — как гифку.
+        # Формат остаётся "gif", меняется только контейнер.
+        build_fmt = "animation" if fmt == "gif" else fmt
         size = size or int(self.config["size"])
 
         refs = await self.gift_refs(message, args)
@@ -2296,9 +2343,9 @@ class GiftGif(loader.Module):
                     MAX_BATCH, MAX_TILES) + self.status())
 
         if not as_grid and len(refs) > 1:
-            return await self._send_batch(message, refs, size=size, fmt=fmt)
+            return await self._send_batch(message, refs, size=size, fmt=build_fmt)
         if len(refs) > 1:
-            return await self._send_grid(message, refs, size=size, fmt=fmt)
+            return await self._send_grid(message, refs, size=size, fmt=build_fmt)
 
         ref = refs[0]
         busy = bool(getattr(self._render_lock, "locked", lambda: False)())
@@ -2310,13 +2357,14 @@ class GiftGif(loader.Module):
             # race over the shared pattern intensity setting.
             async with self._render_lock:
                 path = await asyncio.get_running_loop().run_in_executor(
-                    None, lambda: self.build(ref, size=size, fmt=fmt))
+                    None, lambda: self.build(ref, size=size, fmt=build_fmt))
         except Exception as exc:                       # noqa: BLE001
             return await self.say(
                 message, f"❌ Не получилось: <code>{esc(exc)}</code>\n\n{self.status()}"
                 )
 
         own = str(self.get("caption", "") or "")
+        message._giftgif_animation = build_fmt == "animation"
         caption = (esc(own) + "\n" if own else "") + (
             f"🎁 <b>{esc(os.path.basename(path))}</b> · {size} px · "
             f"{os.path.getsize(path) / 1024:.0f} КБ")
@@ -2340,6 +2388,25 @@ class GiftGif(loader.Module):
     def _base_caption(self, detail: str) -> str:
         own = str(self.get("caption", "") or "")
         return (esc(own) + "\n" if own else "") + detail
+
+    @staticmethod
+    def _animation_attributes(path: str, width: int = 512, height: int = 512,
+                              duration: int = 3):
+        """Атрибуты «гифки» Telegram: video + animated без звука.
+
+        Так клиент рисует её как анимацию в чате и крутит сам — включая iOS,
+        который настоящий .gif показывает файлом. Порядок как у самого
+        Telegram: video, filename, animated.
+        """
+        try:
+            from hikkatl.tl import types as tl
+            return [tl.DocumentAttributeVideo(
+                        duration=duration, w=width, h=height,
+                        supports_streaming=True),
+                    tl.DocumentAttributeFilename(os.path.basename(path)),
+                    tl.DocumentAttributeAnimated()]
+        except Exception:                              # noqa: BLE001
+            return None
 
     @staticmethod
     def _gif_attributes(path: str):
@@ -2397,7 +2464,12 @@ class GiftGif(loader.Module):
         документом со стрелкой «скачать», а не гифкой.
         """
         if path.lower().endswith(".mp4"):
-            await GiftGif._upload(message, path, caption)
+            # mp4 из .gif — «гифка» Telegram: без Animated он показывается
+            # видео с плеером, с ним — крутится сам, как гифка
+            animate = bool(getattr(message, "_giftgif_animation", False))
+            attributes = (GiftGif._animation_attributes(path)
+                          if animate else None)
+            await GiftGif._upload(message, path, caption, attributes)
             return
         attributes = GiftGif._gif_attributes(path)
         try:
@@ -2414,6 +2486,8 @@ class GiftGif(loader.Module):
 
     async def _send_batch(self, message, refs: list, *, size: int, fmt: str) -> None:
         """Пачка: по карточке на подарок, отправляются по очереди."""
+        # fmt помнит, что собрали: "animation" — гифка, "mp4" — обычное видео
+        message._giftgif_animation = fmt == "animation"
         dropped = max(0, len(refs) - MAX_BATCH)
         refs = refs[:MAX_BATCH]
         note = (f"\n(за раз собираю {MAX_BATCH}, остальные {dropped} — "
@@ -2454,6 +2528,7 @@ class GiftGif(loader.Module):
 
     async def _send_grid(self, message, refs: list, *, size: int, fmt: str) -> None:
         """Пачка: одна сетка плиток с подписями в одном видео."""
+        message._giftgif_animation = fmt == "animation"
         dropped = max(0, len(refs) - MAX_TILES)
         refs = refs[:MAX_TILES]
         note = (f"\n(в сетку влезает {MAX_TILES}, остальные {dropped} — "
@@ -2461,7 +2536,8 @@ class GiftGif(loader.Module):
         await self.say(
             message, f"🎁 Собираю сетку из {len(refs)} подарков…{note}")
         folder = tempfile.mkdtemp(prefix="giftgif-")
-        path = os.path.join(folder, "grid." + fmt)
+        # "animation" — не суффикс файла: save_animation сам даст .mp4
+        path = os.path.join(folder, "grid." + (fmt if fmt == "gif" else "mp4"))
         caption = str(self.get("caption", "") or "")
         skipped: list = []
         try:
