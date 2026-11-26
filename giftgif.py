@@ -1,7 +1,7 @@
 # ◇━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━◇
 # meta developer: @n3post
 # scope: Heroku, Hikka
-# version: 1.4.22
+# version: 1.4.24
 # author: n3
 # Description: Подарок Telegram → анимированная карточка GIF или MP4.
 # Собирает ту же карточку, что показывает приложение: градиентный фон,
@@ -18,6 +18,15 @@
 # плитку, нижний ряд включён) — в 1.4.5 низ плитки оставался пустым.
 # 1.4.9: команда .giftest — проверка на трёх печеньках: узор по третям,
 # габарит модели, живая ли анимация, плюс скриншот кадра в чат.
+# 1.4.24: главный баг гифки с 1.4.17 — normalize_fmt("animation") превращал
+# режим анимации в mp4, поэтому гифка собиралась СО звуковой дорожкой, а с
+# ней Telegram обязан показывать видео с плеером. Теперь .gif gif / format:gif
+# дают mp4 без звука (1 поток) и уходят через sendMedia с Animated.
+# 1.4.23: качество. Главное — .gif diag рендерил карточку в 256 px, и клиент
+# растягивал её вчетверо («шакальное»); теперь размер как у обычной сборки.
+# Кодировщик: -tune animation и crf 10 для гифки, 14 для видео (было 16):
+# yuv444p дал бы заметно чище, но это профиль High 4:4:4 — мобильные
+# декодеры его не проигрывают. В статусе подсказка, если размер < 768.
 # 1.4.22: диагностика доступна из уже работающей команды — .gif diag
 # (отдельная .gifdiag могла не зарегистрироваться после обновления, и это
 # ничем не отличалось от «команда не работает»). .gif без подарка и с
@@ -123,7 +132,7 @@ except Exception:  # pragma: no cover
     loader = utils = None
 
 
-MODULE_VERSION = "1.4.22"
+MODULE_VERSION = "1.4.24"
 
 logger = logging.getLogger("giftgif")
 
@@ -1764,7 +1773,7 @@ def save_gif(frames, fps: int, path: str) -> int:
     return os.path.getsize(path)
 
 
-def save_mp4(frames, fps: int, path: str, crf: int = 16,
+def save_mp4(frames, fps: int, path: str, crf: int = 14,
              animation: bool = False) -> int:
     """MP4 через ffmpeg: кадры идут потоком, без 180 PNG на диске.
 
@@ -1797,6 +1806,9 @@ def save_mp4(frames, fps: int, path: str, crf: int = 16,
                     "-shortest"]
     command += [
         "-c:v", "libx264", "-pix_fmt", "yuv420p",
+        # tune animation держит чёткие края плоской графики: без него
+        # границы плитки, текст и узор «плывут» уже на среднем качестве
+        "-tune", "animation",
         "-crf", str(crf), "-preset", "medium", "-threads", "2",
         "-rc-lookahead", "6", "-refs", "2",
     ]
@@ -1927,7 +1939,9 @@ def save_animation(frames, fps: int, fmt: str, path: str) -> str:
     if fmt == "animation":
         # mp4 без звука; расширение принудительно, даже если путь уже .gif
         path = _with_ext(path, ".mp4")
-        save_mp4(frames, fps, path, animation=True)
+        # качество важнее размера: карточка плоская, артефакты на узоре и
+        # тексте видно сразу, а 3 секунды при crf 10 весят считанные сотни КБ
+        save_mp4(frames, fps, path, crf=10, animation=True)
     elif fmt == "mp4":
         save_mp4(frames, fps, path)
     else:
@@ -1936,8 +1950,14 @@ def save_animation(frames, fps: int, fmt: str, path: str) -> str:
 
 
 def normalize_fmt(value, default: str = "gif") -> str:
-    """Поле «формат» из конфига: mp4 / video / видео / gif / гифка → mp4 или gif."""
+    """Поле «формат» из конфига: mp4 / video / видео / gif / гифка → mp4 или gif.
+
+    «animation» (гифка Telegram: mp4 без звуковой дорожки) проходит как есть:
+    иначе он превращался в mp4 и гифка собиралась со звуком.
+    """
     text = str(value or "").strip().lower()
+    if text == "animation":
+        return "animation"
     if text.startswith("mp4") or text.startswith("vid") or "виде" in text:
         return "mp4"
     if text.startswith("gif") or "гиф" in text:
@@ -2145,6 +2165,15 @@ class GiftGif(loader.Module):
 
     def status(self) -> str:
         import importlib.util
+        try:
+            _size = int(self.config["size"])
+        except Exception:                              # noqa: BLE001
+            _size = 1024
+        # карточка растягивается клиентом до ширины чата, поэтому 256 px
+        # выглядят мылом: подсказываем, что размер меняется командой
+        size_note = ("\n💡 <i>{0} px мало — в чате карточка растягивается. "
+                     "Крупнее: <code>.gif 1024</code></i>").format(_size) \
+            if _size < 768 else ""
         have_lottie = importlib.util.find_spec("rlottie_python") is not None
         try:
             ffmpeg_bin()
@@ -2163,14 +2192,15 @@ class GiftGif(loader.Module):
                 "<b>Пачка:</b> {} карточек или сетка {} плиток\n"
                 "<b>Сейчас подписано:</b> {}\n"
                 "<b>Узор:</b> {} % от яркости приложения\n"
-                "<b>Версия:</b> <code>{}</code>").format(
+                "<b>Версия:</b> <code>{}</code>"
+                "{}").format(
                     self.config["format"], self.config["size"],
                     self.config["fps"],
                     "✅" if have_lottie else "❌ нет",
                     "✅" if have_ffmpeg else "❌ нет",
                     MAX_BATCH, MAX_TILES,
                     esc(str(self.get("caption", "") or "")) or "—",
-                    self.config["pattern"], MODULE_VERSION)
+                    self.config["pattern"], MODULE_VERSION, size_note)
 
     # ---------- вход: что именно рендерить ----------
 
@@ -2341,10 +2371,14 @@ class GiftGif(loader.Module):
         lines = ["<b>GiftGif — диагностика</b>"]
         try:
             async with self._render_lock:
+                # размер как у обычной карточки: на 256 px клиент растягивает
+                # картинку вчетверо, и диагностика выглядит «шакальной»
+                diag_size = int(self.config["size"] or 1024)
                 made = await asyncio.get_running_loop().run_in_executor(
                     None, lambda: save_animation(
                         frame_stream(*load_assets(SELFTEST_REFS[0])[:3],
-                                     size=256, fps=30), 30, "animation", path))
+                                     size=diag_size, fps=30),
+                        30, "animation", path))
             width, height, duration = GiftGif._video_meta(made)
             lines.append("• файл: {}×{}, {:.1f} c".format(width or "?", height or "?", duration))
             # 1) сообщение, отправленное прямым путём
@@ -2409,6 +2443,12 @@ class GiftGif(loader.Module):
         # Формат остаётся "gif", меняется только контейнер.
         build_fmt = "animation" if fmt == "gif" else fmt
         size = size or int(self.config["size"])
+
+        # «gif» — это тоже команда-слово: без него в нормализации «gif» из
+        # аргументов терялся и уходил конфиг (обычно mp4) — то есть
+        # `.gif gif` молча отдавал видео
+        if fmt == "gif":
+            build_fmt = "animation"
 
         refs = await self.gift_refs(message, args)
         if not refs:
