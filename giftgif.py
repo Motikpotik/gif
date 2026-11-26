@@ -1,7 +1,7 @@
 # ◇━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━◇
 # meta developer: @n3post
 # scope: Heroku, Hikka
-# version: 1.4.18
+# version: 1.4.19
 # author: n3
 # Description: Подарок Telegram → анимированная карточка GIF или MP4.
 # Собирает ту же карточку, что показывает приложение: градиентный фон,
@@ -18,6 +18,9 @@
 # плитку, нижний ряд включён) — в 1.4.5 низ плитки оставался пустым.
 # 1.4.9: команда .giftest — проверка на трёх печеньках: узор по третям,
 # габарит модели, живая ли анимация, плюс скриншот кадра в чат.
+# 1.4.19: возврат к 1.4.17: nosound в атрибуте и nosound_video в send_file
+# убраны — с ними клиент показывал видео с таймером и иконкой звука.
+# Размеры и длительность по-прежнему настоящие, из самого mp4.
 # 1.4.18: плеер вместо гифки — не хватало флага nosound в
 # DocumentAttributeVideo: без него клиент считает mp4 обычным видео и рисует
 # кнопку play. Теперь nosound=True (+ nosound_video в send_file), а размеры и
@@ -2434,11 +2437,11 @@ class GiftGif(loader.Module):
 
     def _animation_attributes(path: str, width: int = 0, height: int = 0,
                               duration: float = 3.0):
-        """Атрибуты «гифки» Telegram: video(nosound) + animated.
+        """Атрибуты «гифки» Telegram: video + filename + animated.
 
-        nosound — флаг из MTProto: «звука нет, это гифка». Без него клиент
-        рисует обычное видео с плеером (так и вышло в 1.4.17). Порядок как у
-        самого Telegram: video, filename, animated.
+        Ни nosound в атрибуте, ни nosound_video в запросе не ставим: с ними
+        клиент как раз и рисует видео с таймером и иконкой звука (1.4.18).
+        Порядок как у самого Telegram: video, filename, animated.
         """
         try:
             from hikkatl.tl import types as tl
@@ -2448,8 +2451,7 @@ class GiftGif(loader.Module):
             return [tl.DocumentAttributeVideo(
                         duration=max(1, int(round(duration))),
                         w=int(width) or 512, h=int(height) or 512,
-                        round_message=False, supports_streaming=True,
-                        nosound=True),
+                        round_message=False, supports_streaming=True),
                     tl.DocumentAttributeFilename(os.path.basename(path)),
                     tl.DocumentAttributeAnimated()]
         except Exception:                              # noqa: BLE001
@@ -2484,8 +2486,7 @@ class GiftGif(loader.Module):
         try:
             await message.client.send_file(
                 message.chat_id, path, caption=caption, parse_mode="html",
-                supports_streaming=True, force_document=False,
-                nosound_video=True if attributes else None, **extra)
+                supports_streaming=True, force_document=False, **extra)
             return
         except TypeError:
             pass
