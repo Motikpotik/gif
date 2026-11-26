@@ -1,7 +1,7 @@
 # ◇━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━◇
 # meta developer: @n3post
 # scope: Heroku, Hikka
-# version: 1.4.21
+# version: 1.4.22
 # author: n3
 # Description: Подарок Telegram → анимированная карточка GIF или MP4.
 # Собирает ту же карточку, что показывает приложение: градиентный фон,
@@ -18,6 +18,12 @@
 # плитку, нижний ряд включён) — в 1.4.5 низ плитки оставался пустым.
 # 1.4.9: команда .giftest — проверка на трёх печеньках: узор по третям,
 # габарит модели, живая ли анимация, плюс скриншот кадра в чат.
+# 1.4.22: диагностика доступна из уже работающей команды — .gif diag
+# (отдельная .gifdiag могла не зарегистрироваться после обновления, и это
+# ничем не отличалось от «команда не работает»). .gif без подарка и с
+# непонятным текстом показывает справку с номером версии — сразу видно,
+# обновился ли модуль. Версия вынесена в MODULE_VERSION и печатается в
+# статусе и справке.
 # 1.4.21: у гифки нет звуковой дорожки вообще (-an): даже пустая дорожка
 # делает из неё обычное видео. Новая команда .gifdiag — показывает, каким
 # путём ушёл файл, что сохранил сервер и что видит клиент, вместо догадок.
@@ -116,6 +122,8 @@ try:
 except Exception:  # pragma: no cover
     loader = utils = None
 
+
+MODULE_VERSION = "1.4.22"
 
 logger = logging.getLogger("giftgif")
 
@@ -2154,14 +2162,15 @@ class GiftGif(loader.Module):
                 "<b>Проверка:</b> <code>.giftest</code>\n"
                 "<b>Пачка:</b> {} карточек или сетка {} плиток\n"
                 "<b>Сейчас подписано:</b> {}\n"
-                "<b>Узор:</b> {} % от яркости приложения").format(
+                "<b>Узор:</b> {} % от яркости приложения\n"
+                "<b>Версия:</b> <code>{}</code>").format(
                     self.config["format"], self.config["size"],
                     self.config["fps"],
                     "✅" if have_lottie else "❌ нет",
                     "✅" if have_ffmpeg else "❌ нет",
                     MAX_BATCH, MAX_TILES,
                     esc(str(self.get("caption", "") or "")) or "—",
-                    self.config["pattern"])
+                    self.config["pattern"], MODULE_VERSION)
 
     # ---------- вход: что именно рендерить ----------
 
@@ -2323,6 +2332,9 @@ class GiftGif(loader.Module):
     @loader.command()
     async def gifdiag(self, message):
         """| диагностика: какой путь отправки и что вернул сервер"""
+        return await self._diag(message)
+
+    async def _diag(self, message):
         await self.say(message, "🔬 Проверяю отправку гифки…")
         folder = tempfile.mkdtemp(prefix="giftgif-")
         path = os.path.join(folder, "diag.mp4")
@@ -2378,6 +2390,8 @@ class GiftGif(loader.Module):
         lower = args.lower()
         if lower in ("статус", "status", "?"):
             return await self.say(message, self.status())
+        if lower in ("diag", "диаг", "диагностика"):
+            return await self._diag(message)
 
         fmt = "gif" if ("gif" in lower.split() or "гиф" in lower) else None
         if "видео" in lower or "video" in lower or "mp4" in lower:
@@ -2406,6 +2420,7 @@ class GiftGif(loader.Module):
                 "• Размер и формат: <code>.gif 256</code>, "
                 "<code>.gif видео</code>\n"
                 "• Всё по полочкам: <code>.gifhelp</code>\n"
+                "• Диагностика отправки: <code>.gif diag</code>\n"
                 "• Пачка подарков: реплай на сообщение с несколькими подарками "
                 "или список ссылок\n"
                 "  — по карточке на подарок (до {}), "
@@ -2416,6 +2431,16 @@ class GiftGif(loader.Module):
             return await self._send_batch(message, refs, size=size, fmt=build_fmt)
         if len(refs) > 1:
             return await self._send_grid(message, refs, size=size, fmt=build_fmt)
+
+        if not refs:
+            # нечего собирать: показываем версию и подсказку, а не ошибку —
+            # по номеру версии сразу видно, обновился ли модуль
+            return await self.say(message, emoji(
+                "{rocket:} <b>GiftGif {ver}</b>\n"
+                "Подарок не нашёл: пришли <code>.gif</code> реплаем на подарок, "
+                "ссылкой <code>.gif t.me/nft/…</code> или запусти "
+                "<code>.gif diag</code> — диагностика отправки.").format(
+                    ver=MODULE_VERSION))
 
         ref = refs[0]
         busy = bool(getattr(self._render_lock, "locked", lambda: False)())
