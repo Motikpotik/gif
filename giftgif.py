@@ -1,7 +1,7 @@
 # ◇━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━◇
 # meta developer: @n3post
 # scope: Heroku, Hikka
-# version: 1.4.25
+# version: 1.4.26
 # author: n3
 # Description: Подарок Telegram → анимированная карточка GIF или MP4.
 # Собирает ту же карточку, что показывает приложение: градиентный фон,
@@ -18,6 +18,11 @@
 # плитку, нижний ряд включён) — в 1.4.5 низ плитки оставался пустым.
 # 1.4.9: команда .giftest — проверка на трёх печеньках: узор по третям,
 # габарит модели, живая ли анимация, плюс скриншот кадра в чат.
+# 1.4.26: подпись. Прямой sendMedia не знал parse_mode — в чате было видно
+# «<b>gift.mp4</b>»; теперь HTML разбирается в text+entities, значит в подписи
+# работают жирный, код и премиум-эмодзи. Своя подпись через .gifttext
+# принимает {fire:} — анимированные эмодзи. Размер файла пишется как «1.1 МБ».
+# Заодно: emoji() до .format() ронял .giftest/.gifttext c KeyError — исправлено.
 # 1.4.25: прямой sendMedia теперь действительно работает. random_id брался
 # из беззнаковых 64 бит, а в MTProto это знаковый int64 — struct.pack('<q')
 # падал с «'q' format requires …», и КАЖДАЯ гифка с 1.4.20 уходила резервным
@@ -136,7 +141,7 @@ except Exception:  # pragma: no cover
     loader = utils = None
 
 
-MODULE_VERSION = "1.4.25"
+MODULE_VERSION = "1.4.26"
 
 INT64_MAX = 0x7FFFFFFFFFFFFFFF       # random_id в MTProto — знаковый int64
 
@@ -151,6 +156,17 @@ def _random_id() -> int:
     return int.from_bytes(os.urandom(8), "big") & INT64_MAX
 
 logger = logging.getLogger("giftgif")
+
+
+def human_size(path: str) -> str:
+    """1 055 КБ → «1.1 МБ»: в подписи крупное читается лучше."""
+    try:
+        size = os.path.getsize(path)
+    except OSError:
+        return "—"
+    if size >= 1024 * 1024:
+        return "{:.1f} МБ".format(size / (1024 * 1024))
+    return "{:.0f} КБ".format(size / 1024)
 
 
 def esc(text: Any) -> str:
@@ -2052,7 +2068,10 @@ GIFHELP_TEXT = """
 {book:} <b>Своя подпись под карточкой</b>
 <code>.gifttext С Новым годом, бро! 🎄</code> — запомнить текст
 <code>.gifttext убрать</code> — снять подпись
-<blockquote>Эмодзи в подписи рисуются на карточке, а не остаются квадратиками</blockquote>
+{star:} <b>Премиум-эмодзи:</b> <code>.gifttext {fire:} Год змеи</code> —
+фигурные скобки с названием вставляют анимированный эмодзи
+<blockquote>Доступно: fire, star, sparkles, diamond, check, gift… — полный
+список в <code>.gifhelp</code> · обычные эмодзи рисуются на карточке</blockquote>
 
 {chat:} <b>Пачка подарков — по карточке на каждый</b>
 Реплай на сообщение, где несколько подарков, и просто:
@@ -2313,8 +2332,12 @@ class GiftGif(loader.Module):
                 )
         self.set("caption", raw)
         return await self.say(
-            message, f"✅ Подпись сохранена:\n<b>{esc(raw)}</b>\n\nОна появится на всех "
-                     "следующих карточках. Убрать: <code>.gifttext убрать</code>"
+            # подсказку про {fire:} не пропускаем через emoji(): иначе
+            # фигурные скобки превратятся в анимированный эмодзи вместо текста
+            message, "✅ Подпись сохранена:\n<b>" + esc(raw) + "</b>\n\n"
+                     "Она появится на всех следующих карточках. Убрать: "
+                     "<code>.gifttext убрать</code>\n"
+                     "💡 Премиум-эмодзи: <code>.gifttext {fire:} текст</code>"
             )
 
     @loader.command()
@@ -2334,17 +2357,20 @@ class GiftGif(loader.Module):
                     "{warn:} Для <code>.giftest</code> нужен numpy — "
                     "сама сборка карточек работает и без него.\n"
                     "<code>pip install numpy</code>"))
+        # без .format(): «{hourglass:}» — шаблон эмодзи, format() принял бы
+        # его за подстановку и падал с KeyError
         await self.say(
             message, emoji(
-                "{hourglass:} <b>Проверяю</b> {} шт. — займёт десяток секунд…"
-            ).format(len(refs)))
+                "{hourglass:} <b>Проверяю</b> " + str(len(refs))
+                + " шт. — займёт десяток секунд…"))
         try:
             async with self._render_lock:
                 results, previews = await asyncio.get_running_loop().run_in_executor(
                     None, lambda: build_selftest(refs, size=size, fps=30))
         except Exception as exc:                       # noqa: BLE001
             return await self.say(
-                message, emoji("❌ Проверка не прошла: <code>{}</code>").format(esc(exc)))
+                message,
+                emoji("❌ Проверка не прошла: <code>" + esc(exc) + "</code>"))
         checks = selftest_verdict(results)
         failed = [name for name, ok, _ in checks if not ok]
         lines = []
@@ -2492,11 +2518,10 @@ class GiftGif(loader.Module):
             # нечего собирать: показываем версию и подсказку, а не ошибку —
             # по номеру версии сразу видно, обновился ли модуль
             return await self.say(message, emoji(
-                "{rocket:} <b>GiftGif {ver}</b>\n"
+                "{rocket:} <b>GiftGif " + MODULE_VERSION + "</b>\n"
                 "Подарок не нашёл: пришли <code>.gif</code> реплаем на подарок, "
                 "ссылкой <code>.gif t.me/nft/…</code> или запусти "
-                "<code>.gif diag</code> — диагностика отправки.").format(
-                    ver=MODULE_VERSION))
+                "<code>.gif diag</code> — диагностика отправки."))
 
         ref = refs[0]
         busy = bool(getattr(self._render_lock, "locked", lambda: False)())
@@ -2514,11 +2539,10 @@ class GiftGif(loader.Module):
                 message, f"❌ Не получилось: <code>{esc(exc)}</code>\n\n{self.status()}"
                 )
 
-        own = str(self.get("caption", "") or "")
         message._giftgif_animation = build_fmt == "animation"
-        caption = (esc(own) + "\n" if own else "") + (
+        caption = self._base_caption(
             f"🎁 <b>{esc(os.path.basename(path))}</b> · {size} px · "
-            f"{os.path.getsize(path) / 1024:.0f} КБ")
+            f"{human_size(path)}")
         try:
             # видео — как видео (играет в чате), gif — через answer_file
             await self._deliver(message, path, caption)
@@ -2538,7 +2562,7 @@ class GiftGif(loader.Module):
 
     def _base_caption(self, detail: str) -> str:
         own = str(self.get("caption", "") or "")
-        return (esc(own) + "\n" if own else "") + detail
+        return (emoji(esc(own)) + "\n" if own else "") + emoji(detail)
 
     @staticmethod
     def _video_meta(path: str, fps: int = 30) -> tuple:
@@ -2640,6 +2664,15 @@ class GiftGif(loader.Module):
                           round_message=False, supports_streaming=True),
                       tl.DocumentAttributeFilename(os.path.basename(path)),
                       tl.DocumentAttributeAnimated()]
+        # подпись с разметкой: sendMedia не знает parse_mode, поэтому HTML
+        # разбираем сами — иначе в чате видно «<b>gift.mp4</b>» как текст
+        text, entities = (caption or ""), []
+        if text:
+            try:
+                text, entities = await message.client._parse_message_text(
+                    text, "html")
+            except Exception:                          # noqa: BLE001
+                text, entities = (caption or ""), []
         try:
             uploaded = await message.client.upload_file(path)
             media = tl.InputMediaUploadedDocument(
@@ -2647,7 +2680,8 @@ class GiftGif(loader.Module):
             sent = await message.client(
                 tl_root.functions.messages.SendMediaRequest(
                     peer=await message.client.get_input_entity(message.chat_id),
-                    media=media, message=caption or "",
+                    media=media, message=text,
+                    entities=entities or None,
                     random_id=_random_id()))
             logger.debug("gif: sendMedia ok, attrs=%s",
                          GiftGif._sent_attributes_sync(sent))
@@ -2730,8 +2764,7 @@ class GiftGif(loader.Module):
     async def _send_file(self, message, path: str) -> None:
         """Видео — как видео (играет в чате), GIF — как GIF."""
         await self._deliver(message, path, self._base_caption(
-            f"🎁 <b>{esc(os.path.basename(path))}</b> · "
-            f"{os.path.getsize(path) / 1024:.0f} КБ"))
+            f"🎁 <b>{esc(os.path.basename(path))}</b> · {human_size(path)}"))
 
     async def _send_batch(self, message, refs: list, *, size: int, fmt: str) -> None:
         """Пачка: по карточке на подарок, отправляются по очереди."""
