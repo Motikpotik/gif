@@ -1,7 +1,7 @@
 # ◇━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━◇
 # meta developer: @n3post
 # scope: Heroku, Hikka
-# version: 1.4.27
+# version: 1.4.28
 # author: n3
 # Description: Подарок Telegram → анимированная карточка GIF или MP4.
 # Собирает ту же карточку, что показывает приложение: градиентный фон,
@@ -18,6 +18,12 @@
 # плитку, нижний ряд включён) — в 1.4.5 низ плитки оставался пустым.
 # 1.4.9: команда .giftest — проверка на трёх печеньках: узор по третям,
 # габарит модели, живая ли анимация, плюс скриншот кадра в чат.
+# 1.4.28: «Отправка не удалась: send_message() got an unexpected keyword
+# argument 'caption'». В сборках, где send_file не умеет caption, лишний
+# kwargs уходил в send_message. Теперь видео и гифка уходят одним и тем же
+# прямым sendMedia вместе с подписью, send_file — только запасной путь,
+# и он откатывается по шагам (с подписью → без → без атрибутов → sendMedia),
+# поэтому файл доходит даже на урезанном клиенте.
 # 1.4.27: свой текст больше не дублируется. Раньше он всегда шёл и в кадр,
 # и в подпись к файлу. Теперь два отдельных переключателя: card_caption
 # (текст на карточке, по умолчанию да) и file_caption (подпись к файлу в
@@ -148,7 +154,7 @@ except Exception:  # pragma: no cover
     loader = utils = None
 
 
-MODULE_VERSION = "1.4.27"
+MODULE_VERSION = "1.4.28"
 
 INT64_MAX = 0x7FFFFFFFFFFFFFFF       # random_id в MTProto — знаковый int64
 
@@ -2693,6 +2699,19 @@ class GiftGif(loader.Module):
         Animated до сервера не доходил, и клиент рисовал видео с таймером.
         Возвращает ответ сервера либо None, если путь недоступен.
         """
+        return await GiftGif._send_media(message, path, caption, animated=True)
+
+    @staticmethod
+    async def _send_media(message, path: str, caption: str = None,
+                          *, animated: bool = False):
+        """Файл напрямую в sendMedia: подпись уходит в том же запросе.
+
+        Через send_file подпись работает не везде: в сборках, где у
+        send_file нет caption, kwargs уходят в send_message — и вместо
+        файла с подписью в чат приходит «Отправка не удалась: send_message()
+        got an unexpected keyword argument 'caption'». Поэтому подпись
+        передаём сами, а send_file остаётся запасным путём без подписи.
+        """
         try:
             from hikkatl import tl as tl_root
             from hikkatl.tl import types as tl
@@ -2703,8 +2722,9 @@ class GiftGif(loader.Module):
                           duration=max(1, int(round(duration))),
                           w=int(width) or 512, h=int(height) or 512,
                           round_message=False, supports_streaming=True),
-                      tl.DocumentAttributeFilename(os.path.basename(path)),
-                      tl.DocumentAttributeAnimated()]
+                      tl.DocumentAttributeFilename(os.path.basename(path))]
+        if animated:
+            attributes.append(tl.DocumentAttributeAnimated())
         # подпись с разметкой: sendMedia не знает parse_mode, поэтому HTML
         # разбираем сами — иначе в чате видно «<b>gift.mp4</b>» как текст
         text, entities = (caption or ""), []
@@ -2716,19 +2736,22 @@ class GiftGif(loader.Module):
                 text, entities = (caption or ""), []
         try:
             uploaded = await message.client.upload_file(path)
+            mime = ("image/gif" if path.lower().endswith(".gif")
+                    else "video/mp4")
             media = tl.InputMediaUploadedDocument(
-                file=uploaded, mime_type="video/mp4", attributes=attributes)
+                file=uploaded, mime_type=mime, attributes=attributes)
             sent = await message.client(
                 tl_root.functions.messages.SendMediaRequest(
                     peer=await message.client.get_input_entity(message.chat_id),
                     media=media, message=text,
                     entities=entities or None,
                     random_id=_random_id()))
-            logger.debug("gif: sendMedia ok, attrs=%s",
+            logger.debug("gif: sendMedia ok (animated=%s), attrs=%s", animated,
                          GiftGif._sent_attributes_sync(sent))
             return sent
         except Exception:                              # noqa: BLE001
-            logger.exception("gif: sendMedia не удался — резервный путь")
+            logger.exception("gif: sendMedia не удался — резервный путь "
+                             "(без подписи, файлом)")
             return None
 
     @staticmethod
@@ -2746,31 +2769,39 @@ class GiftGif(loader.Module):
 
     @staticmethod
     async def _upload(message, path: str, caption: str = None,
-                      attributes=None) -> None:
+                      attributes=None) -> bool:
         """Отправка файла с подписью; если клиент не принял — без подписи.
 
-        Откаты идут по одному признаку за раз: сначала без подписи (старые
-        сборки), потом без атрибутов (клиент не знает про attributes).
+        Откаты идут по одному признаку за раз: с подписью → без подписи →
+        без атрибутов → прямым sendMedia без подписи. Ловим не только
+        TypeError: у send_file, который не знает про caption, ошибка
+        прилетает из send_message («unexpected keyword argument») — файл
+        всё равно должен уйти.
         """
         extra = {"attributes": attributes} if attributes else {}
-        try:
-            await message.client.send_file(
-                message.chat_id, path, caption=caption, parse_mode="html",
-                supports_streaming=True, force_document=False, **extra)
-            return
-        except TypeError:
-            pass
-        try:
-            await message.client.send_file(
-                message.chat_id, path, supports_streaming=True,
-                force_document=False, **extra)
-        except TypeError:
-            await message.client.send_file(
-                message.chat_id, path, supports_streaming=True,
-                force_document=False)
+        attempts = []
         if caption:
-            with contextlib.suppress(Exception):
-                await utils.answer(message, caption, parse_mode="html")
+            attempts.append({"caption": caption, "parse_mode": "html",
+                             "supports_streaming": True,
+                             "force_document": False, **extra})
+        attempts.append({"supports_streaming": True, "force_document": False,
+                         **extra})
+        attempts.append({"force_document": True})
+        error = None
+        for kwargs in attempts:
+            try:
+                await message.client.send_file(message.chat_id, path, **kwargs)
+                return True
+            except Exception as exc:                   # noqa: BLE001
+                error = exc
+                logger.debug("gif: send_file %s не принял — пробую иначе",
+                             sorted(kwargs))
+        # последний шанс: тот же sendMedia, но без подписи
+        if await GiftGif._send_media(message, path, None):
+            return True
+        if error is not None:
+            raise error
+        raise RuntimeError("не удалось отправить файл")
 
     @staticmethod
     async def _deliver(message, path: str, caption: str) -> None:
@@ -2793,7 +2824,15 @@ class GiftGif(loader.Module):
                     path, width, height, duration)
                 await GiftGif._upload(message, path, caption, attributes)
                 return
+            # видео тоже прямым запросом: подпись уходит вместе с файлом,
+            # а не теряется в kwargs send_file (см. _send_media)
+            sent = await GiftGif._send_media(message, path, caption)
+            if sent is not None:
+                return
             await GiftGif._upload(message, path, caption)
+            return
+        sent = await GiftGif._send_media(message, path, caption)
+        if sent is not None:
             return
         attributes = GiftGif._gif_attributes(path)
         try:
