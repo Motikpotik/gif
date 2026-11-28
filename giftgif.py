@@ -1,7 +1,7 @@
 # ◇━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━◇
 # meta developer: @n3post
 # scope: Heroku, Hikka
-# version: 1.6.3
+# version: 1.6.4
 # author: n3
 # Description: Подарок Telegram → анимированная карточка GIF или MP4.
 # Собирает ту же карточку, что показывает приложение: градиентный фон,
@@ -18,6 +18,13 @@
 # плитку, нижний ряд включён) — в 1.4.5 низ плитки оставался пустым.
 # 1.4.9: команда .giftest — проверка на трёх печеньках: узор по третям,
 # габарит модели, живая ли анимация, плюс скриншот кадра в чат.
+# 1.6.4: убраны светлые полосы на стыках кусков мозаики. Куски были с
+# прозрачным краем (ресайз каждого куска отдельно захватывал пустоту за его
+# границей, плюс скруглённый угол карточки), и Telegram подмешивал под них
+# светлый фон — на стыках проступала линия. Теперь один общий ресайз на всю
+# карточку, резка без ресайза, прозрачность подложена цветом карточки, а
+# градиент фона считается попиксельно вместо растягивания из 48×48 (та
+# сетка давала ровные ступеньки внутри кусков).
 # 1.6.3: .giftemoji собирает пачку сама — набор на каждый подарок.
 # Несколько ссылок в одной команде или целая коллекция (@username,
 # t.me/a/<имя>): команда по очереди делает набор на каждый подарок, ведёт
@@ -226,7 +233,7 @@ except Exception:  # pragma: no cover
     loader = utils = None
 
 
-MODULE_VERSION = "1.6.3"
+MODULE_VERSION = "1.6.4"
 
 INT64_MAX = 0x7FFFFFFFFFFFFFFF       # random_id в MTProto — знаковый int64
 
@@ -971,9 +978,27 @@ def pattern_alpha(pattern: Image.Image) -> Image.Image:
 
 def radial_gradient(rgb: tuple[int, int, int], size: tuple[int, int],
                     radius: float = RADIAL_R) -> Image.Image:
-    """Radial spotlight as in the app: the corner value is the second stop."""
+    """Radial spotlight as in the app: the corner value is the second stop.
+
+    Считается попиксельно. Раньше градиент рисовался на сетке 48×48 и
+    растягивался бикубиком: при нарезке мозаики это давало на стыках кусков
+    видимые ровные полосы — у каждого куска своя ступенька растра.
+    """
     top, bottom = rgb
     width, height = size
+    # numpy необязателен: без него остаётся старый путь 48×48 + бикубик,
+    # иначе модуль падал бы на хостах без numpy
+    if np is not None:
+        xx, yy = np.meshgrid(np.arange(width), np.arange(height))
+        dx = (xx + .5) / width - .5
+        dy = (yy + .5) / height - .5
+        distance = np.minimum(1.0, np.sqrt(dx * dx + dy * dy) / radius)
+        data = np.empty((height, width, 3), dtype=np.uint8)
+        for channel in range(3):
+            data[:, :, channel] = np.round(
+                top[channel] + (bottom[channel] - top[channel]) * distance
+            ).astype(np.uint8)
+        return Image.fromarray(data, "RGB")
     small = Image.new("RGB", (48, 48))
     pixels = small.load()
     for iy in range(48):
@@ -2218,6 +2243,29 @@ def _tile_pieces(paths: list, cols: int, rows: int) -> Image.Image:
     return canvas
 
 
+def _flatten_alpha(tile: Image.Image) -> Image.Image:
+    """Убрать прозрачность, подложив цвет самой карточки.
+
+    Прозрачным в куске остаётся только скруглённый угол карточки. Оставить
+    его нельзя: Telegram подмешивает под такие пиксели светлый фон, и на
+    стыке кусков проступает полоса. Цвет берём из непрозрачной части этого
+    же куска, поэтому угол растворяется в фоне карточки.
+    """
+    alpha = tile.getchannel("A")
+    if alpha.getextrema()[0] == 255:
+        return tile
+    opaque = tile.convert("RGB")
+    mask = alpha.point(lambda value: 255 if value > 200 else 0)
+    box = mask.getbbox()
+    if box is None:
+        return tile
+    corner = opaque.crop(box).resize((1, 1), Image.Resampling.BOX)
+    fill = corner.getpixel((0, 0))
+    backing = Image.new("RGB", tile.size, fill)
+    backing.paste(opaque, (0, 0), alpha)
+    return backing.convert("RGBA")
+
+
 def save_emoji_sticker(image: Image.Image, path: str,
                        lossless: bool = False) -> str:
     """Картинка-эмодзи: ровно 100×100 RGBA в WEBP.
@@ -2235,6 +2283,7 @@ def save_emoji_sticker(image: Image.Image, path: str,
     # поэтому предупреждаем только там, где это действительно ошибка
     if tile.getchannel("A").getextrema()[0] != 0:
         logger.debug("gif: кусок без прозрачности — так и задумано для мозаики")
+    tile = _flatten_alpha(tile)
     target = _with_ext(path, ".webp")
     if lossless:
         # Куски мозаики жмутся без потерь: flat-арт весит копейки, зато на
@@ -3863,6 +3912,14 @@ class GiftGif(loader.Module):
             # контур модели «лестницей», картинка мыльная.
             side = int(cols * EMOJI_SIDE * EMOJI_RENDER)
             sheet = card_picture(card, lottie, pattern, side=side)
+            # Один общий ресайз на всю карточку, а не на каждый кусок.
+            # При поштучном ресайзе Ланцош захватывает пустоту за границей
+            # куска: крайние пиксели выходят полупрозрачными и на стыках
+            # проступают светлые полосы. Общий ресайз даёт на стыках
+            # соседние пиксели одного полотна — полос нет.
+            target = (cols * EMOJI_SIDE, rows * EMOJI_SIDE)
+            if sheet.size != target:
+                sheet = sheet.resize(target, Image.Resampling.LANCZOS)
             folder = tempfile.mkdtemp(prefix="giftgif-")
             return slice_picture(sheet, folder, cols, rows)
 
