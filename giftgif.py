@@ -1,7 +1,7 @@
 # ◇━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━◇
 # meta developer: @n3post
 # scope: Heroku, Hikka
-# version: 1.6.1
+# version: 1.6.2
 # author: n3
 # Description: Подарок Telegram → анимированная карточка GIF или MP4.
 # Собирает ту же карточку, что показывает приложение: градиентный фон,
@@ -18,6 +18,13 @@
 # плитку, нижний ряд включён) — в 1.4.5 низ плитки оставался пустым.
 # 1.4.9: команда .giftest — проверка на трёх печеньках: узор по третям,
 # габарит модели, живая ли анимация, плюс скриншот кадра в чат.
+# 1.6.2: убран огромный силуэт за моделью и появился отчёт о работе.
+# Силуэт рисовался дважды: узор уже есть в самой плитке, а сверху
+# накладывался ещё один крупный мотив — отсюда «пятно» за пряником.
+# Команда теперь рассказывает, что делает: прогресс нарезки после каждой
+# карточки, «куски готовы», ход загрузки по пачкам и итог «N из M за X с».
+# Прогресс живёт в своём сообщении, а не в ответе на команду: раньше он
+# затирался, а после удаления команды в чате не оставалось ничего.
 # 1.6.1: превью показывает саму мозаику. Раньше оно рендерило карточки
 # заново по ссылкам и складывало сеткой 3×3 — на выходе девять одинаковых
 # пряников вместо полотна и счётчик «в превью не попало». Теперь превью
@@ -210,7 +217,7 @@ except Exception:  # pragma: no cover
     loader = utils = None
 
 
-MODULE_VERSION = "1.6.1"
+MODULE_VERSION = "1.6.2"
 
 INT64_MAX = 0x7FFFFFFFFFFFFFFF       # random_id в MTProto — знаковый int64
 
@@ -2132,16 +2139,9 @@ def card_picture(card: Card, lottie_bytes: bytes, pattern,
     canvas = tile_image(card, pattern, width)
     if canvas.size != (width, height):
         canvas = canvas.resize((width, height), Image.Resampling.LANCZOS)
-    if pattern is not None:
-        motif_side = int(min(width, height) * 0.86)
-        mask = pattern_alpha(pattern).resize(
-            (motif_side, motif_side), Image.Resampling.LANCZOS)
-        tone = pattern_color_rgba(card, EMOJI_PATTERN_ALPHA)
-        motif = Image.new("RGBA", mask.size, tone)
-        layer = Image.new("RGBA", (width, height), (0, 0, 0, 0))
-        layer.paste(motif, ((width - motif_side) // 2,
-                            (height - motif_side) // 2), mask)
-        canvas.alpha_composite(layer)
+    # Никакого второго силуэта поверх: узор подарка уже нарисован в самой
+    # плитке (tile_image -> tile_pattern). Раньше он же накладывался ещё
+    # раз крупным мотивом, и за моделью появлялся огромный задний план.
     try:
         from rlottie_python import LottieAnimation
     except ImportError as exc:
@@ -2809,11 +2809,15 @@ class GiftGif(loader.Module):
                 + str(bot_id) + ") — Bot API так не умеет и ответит "
                 "USER_IS_BOT.\nВ <code>owner_id</code> нужен твой личный ID, "
                 "а не бота."))
+        started = time.time()
         cols, rows = self._emoji_grid(len(refs))
         total = len(refs) * cols * rows
-        await self.say(message, "💎 Режу карточку на куски… "
-                       f"({total} шт.)")
-        progress = {"at": time.time()}
+        # Своё сообщение под прогресс, а не общее .say: раньше проценты
+        # уходили в ответ на команду и затирали друг друга, а после
+        # удаления команды в чате не оставалось вообще ничего.
+        head = await self.say_head(
+            message, "💎 Режу карточку на куски… (0/%d)" % total)
+        progress = {"at": time.time(), "head": head, "stage": "cut"}
         made, failures, stickers = [], [], []
         built = []
         # рендер под общим замком, как у .gif: два тяжёлых кадра сразу
@@ -2837,14 +2841,11 @@ class GiftGif(loader.Module):
                     failures.append(f"{esc(ref)}: {esc(exc)}")
                     with contextlib.suppress(Exception):
                         shutil.rmtree(folder, ignore_errors=True)
-                # обновляем служебное сообщение: куски собираются не мгновенно
-                if (index % 5 == 0 or index == len(refs)) \
-                        and time.time() - progress["at"] > 2.5:
-                    progress["at"] = time.time()
-                    with contextlib.suppress(Exception):
-                        await utils.answer(
-                            message, "💎 Режу карточку на куски… "
-                                     f"{len(stickers)}/{total}")
+                # прогресс после КАЖДОЙ карточки: рендер одной занимает
+                # несколько секунд, и без правок чат выглядит зависшим
+                await self.say_update(
+                    head, message,
+                    "💎 Режу карточку на куски… %d/%d" % (len(stickers), total))
                 if index < len(refs):
                     await asyncio.sleep(0.05)
         if not stickers:
@@ -2865,6 +2866,8 @@ class GiftGif(loader.Module):
                          "<code>.cfg GiftGif</code>.")
         short_name = ""
         card_title = self._emoji_title(stickers[0][0])
+        await self.say_update(
+            head, message, "💎 Куски готовы: %d · создаю набор…" % len(stickers))
 
         def push(batch: list, first: bool) -> None:
             """Одна пачка: первый вызов создаёт набор, дальше только добавить."""
@@ -2934,17 +2937,32 @@ class GiftGif(loader.Module):
                             "пришли его мне.")
                 return await self.say(message, emoji(
                     "{warn:} Набор не создался: <code>" + esc(text) + "</code>\n" + hint))
+        packs = 0
         for start in range(0, len(rest), EMOJI_CREATE_BATCH):
             batch = rest[start:start + EMOJI_CREATE_BATCH]
+            number = start // EMOJI_CREATE_BATCH + 2
+            await self.say_update(
+                head, message,
+                "💎 Загружаю в Telegram… %d/%d (пачка %d)"
+                % (len(made), len(stickers), number))
             try:
                 await asyncio.get_running_loop().run_in_executor(
                     None, lambda b=batch: push(b, False))
                 made.extend(ref for ref, _blob in batch)
+                packs += 1
             except Exception as exc:                   # noqa: BLE001
-                failures.append(f"пачка {start // EMOJI_CREATE_BATCH + 2}: "
-                                f"{esc(exc)}")
+                # одна неудачная пачка не должна обнулять весь набор
+                failures.append("пачка %d (%d кусков): %s"
+                                % (number, len(batch), esc(exc)))
 
         await self._drop(message)
+        # Отчёт: что именно произошло. Раньше при сбое посреди загрузки
+        # команда молчала, и понять причину было нельзя.
+        took = time.time() - started
+        await self.say_update(
+            head, message,
+            "💎 Готово: %d из %d кусков за %.1f с · пачек %d"
+            % (len(made), len(stickers) or total, took, packs + 1))
         caption = (
             "{diamond:} <b>Набор премиум-эмодзи готов</b>\n"
             "Кусков: " + str(len(made)) + " · " + str(cols) + "×" + str(rows) + " "
@@ -2953,7 +2971,9 @@ class GiftGif(loader.Module):
             "Открой набор и нажми «Добавить» — в сообщении он появится "
             "как обычный 🎁.")
         if failures:
-            caption += "\n\n⚠️ Не вышло: " + "; ".join(failures[:3])
+            caption += ("\n\n⚠️ Не вышло: " + "; ".join(failures[:3])
+                        + ("\n<i>и ещё %d</i>" % (len(failures) - 3)
+                           if len(failures) > 3 else ""))
         # превью — из тех же кусков, что ушли в набор: одно полотно, а не
         # девять перерисованных карточек
         jobs = [(ref, paths, cols, rows)
@@ -3015,6 +3035,22 @@ class GiftGif(loader.Module):
     def _emoji_room(self) -> int:
         """Сколько ещё эмодзи примет сервер: 120 — потолок статики."""
         return EMOJI_MAX
+
+    async def say_head(self, message, text: str):
+        """Отдельное сообщение под прогресс; возвращает его для правок."""
+        with contextlib.suppress(Exception):
+            return await self.say(message, text)
+        return None
+
+    async def say_update(self, head, message, text: str) -> None:
+        """Правка сообщения прогресса; если не вышло — молча продолжаем."""
+        if head is None:
+            return
+        with contextlib.suppress(Exception):
+            await head.edit(text)
+            return
+        with contextlib.suppress(Exception):
+            await utils.answer(head, text)
 
     def _emoji_grid(self, count: int) -> tuple:
         """Сколько кусков нарезать по горизонтали и вертикали.
