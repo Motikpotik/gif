@@ -1,7 +1,7 @@
 # ◇━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━◇
 # meta developer: @n3post
 # scope: Heroku, Hikka
-# version: 1.5.3
+# version: 1.5.4
 # author: n3
 # Description: Подарок Telegram → анимированная карточка GIF или MP4.
 # Собирает ту же карточку, что показывает приложение: градиентный фон,
@@ -18,6 +18,12 @@
 # плитку, нижний ряд включён) — в 1.4.5 низ плитки оставался пустым.
 # 1.4.9: команда .giftest — проверка на трёх печеньках: узор по третям,
 # габарит модели, живая ли анимация, плюс скриншот кадра в чат.
+# 1.5.4: USER_IS_BOT. В createNewStickerSet user_id — это ВЛАДЕЛЕЦ
+# набора, человек, а не бот. Я подставлял туда id бота (он зашит в токен
+# до двоеточия), Telegram и отвечал USER_IS_BOT. Владелец теперь: настройка
+# owner_id → автор команды → аккаунт Hikka (_tg_id). Новая настройка
+# owner_id. Все ответы Bot API разбираются: USER_IS_BOT, PREMIUM,
+# занятое имя, эмодзи, размеры — вместо одного «частая причина».
 # 1.5.3: токен бота ищется по смыслу, а не по точному совпадению.
 # Токен вытаскивается регуляркой из любой строки (вставили текст из
 # BotFather с лишними строками), из списка и из словаря. Валидатор поля
@@ -184,7 +190,7 @@ except Exception:  # pragma: no cover
     loader = utils = None
 
 
-MODULE_VERSION = "1.5.3"
+MODULE_VERSION = "1.5.4"
 
 INT64_MAX = 0x7FFFFFFFFFFFFFFF       # random_id в MTProto — знаковый int64
 
@@ -2269,6 +2275,12 @@ class GiftGif(loader.Module):
                 validator=loader.validators.Choice(["mp4", "gif"]),
             ),
             loader.ConfigValue(
+                "owner_id", 0,
+                "Твой Telegram ID — владелец набора эмодзи (.giftemoji). "
+                "Если 0, берётся аккаунт, из которого запущена команда",
+                validator=loader.validators.Integer(minimum=0),
+            ),
+            loader.ConfigValue(
                 "size", 1024,
                 "Сторона карточки в пикселях (512 / 768 / 1024)",
                 validator=loader.validators.Integer(minimum=64, maximum=1536),
@@ -2647,10 +2659,25 @@ class GiftGif(loader.Module):
                 "<code>t.me/addemoji/…</code>"))
         free = self._emoji_room()
         refs = refs[:max(1, min(EMOJI_MAX, free))]
+        # user_id в createNewStickerSet — это ВЛАДЕЛЕЦ набора, то есть
+        # человек. Если подставить id бота (он зашит в токен до двоеточия),
+        # Bot API отвечает USER_IS_BOT: набором владеет бот, а не человек.
+        owner_id = self._emoji_owner_id()
+        if not owner_id:
+            return await self.say(message, emoji(
+                "{warn:} Не понял, на кого создавать набор: нужен твой "
+                "Telegram ID.\nВпиши его в <code>.cfg GiftGif</code> → "
+                "<code>owner_id</code> (узнать: <code>.giftemoji_diag</code>)."))
         try:
             bot_id = GiftGif._emoji_bot_id(token)
         except RuntimeError as exc:
             return await self.say(message, f"❌ {esc(exc)}")
+        if owner_id == bot_id:
+            return await self.say(message, emoji(
+                "{warn:} Владельцем набора указан сам бот (id "
+                + str(bot_id) + ") — Bot API так не умеет и ответит "
+                "USER_IS_BOT.\nВ <code>owner_id</code> нужен твой личный ID, "
+                "а не бота."))
         await self.say(message, "💎 Собираю эмодзи…" + (
             f" ({len(refs)} шт.)" if len(refs) > 1 else ""))
         progress = {"at": time.time()}
@@ -2711,7 +2738,7 @@ class GiftGif(loader.Module):
                               "keywords": ["подарок", "gift"]})
             if first:
                 GiftGif.api_sync(token, "createNewStickerSet", {
-                    "user_id": bot_id,
+                    "user_id": owner_id,
                     "name": short_name,
                     "title": "GiftGif подарки"[:64],
                     "stickers": json.dumps(items),
@@ -2721,7 +2748,7 @@ class GiftGif(loader.Module):
                 for index, item in enumerate(items):
                     key = "sticker%d" % index
                     GiftGif.api_sync(token, "addStickerToSet", {
-                        "user_id": bot_id,
+                        "user_id": owner_id,
                         "name": short_name,
                         "sticker": json.dumps(item),
                     }, {key: files[key]})
@@ -2745,10 +2772,27 @@ class GiftGif(loader.Module):
                     None, lambda: push(first, True))
                 made = [ref for ref, _blob in first]
             except Exception as exc2:                  # noqa: BLE001
+                text = str(exc2)
+                if "USER_IS_BOT" in text:
+                    hint = ("Владельцем набора указан бот. Нужен твой Telegram "
+                            "ID: <code>owner_id</code> в "
+                            "<code>.cfg GiftGif</code> (см. "
+                            "<code>.giftemoji_diag</code>).")
+                elif "PREMIUM" in text.upper():
+                    hint = ("Похоже, у аккаунта нет Telegram Premium — без "
+                            "него премиум-эмодзи создать нельзя.")
+                elif "STICKERSET_INVALID" in text or "already" in text.lower():
+                    hint = ("Такое имя набора уже занято. Повтори команду — "
+                            "имя генерируется заново.")
+                elif "STICKER_EMOJI_INVALID" in text:
+                    hint = "Telegram не принял эмодзи 🎁 в этом наборе."
+                elif "DIMENSIONS" in text.upper():
+                    hint = "Картинка не 512×512 — это ошибка рендера."
+                else:
+                    hint = ("Полный ответ Telegram — выше. Если не ясно, "
+                            "пришли его мне.")
                 return await self.say(message, emoji(
-                    "{warn:} Набор не создался: <code>" + esc(exc2) + "</code>\n"
-                    "Частая причина — нет Telegram Premium у владельца бота "
-                    "или бот не может создавать наборы."))
+                    "{warn:} Набор не создался: <code>" + esc(text) + "</code>\n" + hint))
         for start in range(0, len(rest), EMOJI_CREATE_BATCH):
             batch = rest[start:start + EMOJI_CREATE_BATCH]
             try:
@@ -2809,6 +2853,8 @@ class GiftGif(loader.Module):
         inline = getattr(client, "hikka_inline", None) if client else None
         show("inline._token", getattr(inline, "_token", None) if inline else None)
         show("итоговый токен", self._emoji_token() or "НЕ НАЙДЕН")
+        show("owner_id (владелец набора)", self._emoji_owner_id(message) or "НЕ НАЙДЕН")
+        show("_tg_id (аккаунт Hikka)", getattr(self, "_tg_id", None))
         try:
             rows = [f"{k}={v!r}" for k, v in self.config.items()]
             lines.append("весь config: <code>" + esc(", ".join(rows))[:600] + "</code>")
@@ -2820,6 +2866,30 @@ class GiftGif(loader.Module):
     def _emoji_room(self) -> int:
         """Сколько ещё эмодзи примет сервер: 120 — потолок статики."""
         return EMOJI_MAX
+
+    def _emoji_owner_id(self, message=None) -> int:
+        """Владелец набора эмодзи — человек, а не бот.
+
+        Порядок: настройка `owner_id` → автор сообщения (реплай, если
+        команда отправлена ответом) → аккаунт, под которым работает
+        Hikka. Бот владельцем быть не может: Bot API отвечает USER_IS_BOT.
+        """
+        try:
+            configured = int(self._conf("owner_id", 0) or 0)
+        except (TypeError, ValueError):
+            configured = 0
+        if configured > 0:
+            return configured
+        for source in ((message.sender_id if message is not None else None),
+                       getattr(self, "_tg_id", None),
+                       getattr(getattr(self, "client", None), "tg_id", None)):
+            try:
+                candidate = int(source or 0)
+            except (TypeError, ValueError):
+                continue
+            if candidate > 0:
+                return candidate
+        return 0
 
     @staticmethod
     def _emoji_bot_id(token: str) -> int:
