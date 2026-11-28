@@ -1,7 +1,7 @@
 # ◇━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━◇
 # meta developer: @n3post
 # scope: Heroku, Hikka
-# version: 1.5.0
+# version: 1.5.1
 # author: n3
 # Description: Подарок Telegram → анимированная карточка GIF или MP4.
 # Собирает ту же карточку, что показывает приложение: градиентный фон,
@@ -18,6 +18,13 @@
 # плитку, нижний ряд включён) — в 1.4.5 низ плитки оставался пустым.
 # 1.4.9: команда .giftest — проверка на трёх печеньках: узор по третям,
 # габарит модели, живая ли анимация, плюс скриншот кадра в чат.
+# 1.5.1: .giftemoji починен целиком. Токен бота читался не оттуда: Hikka
+# держит базу в self._db, а несуществующий импорт database молча глотал
+# ошибку — из-за этого команда всегда просила токен. Набор создавался как
+# обычный стикерпак: добавлены sticker_type=custom_emoji и emoji_list (поля
+# emoji в Bot API нет), имя теперь заканчивается на _by_<бот>, стикеры идут
+# в WEBP 512×512 батчами по 50. Превью собирается по одной плитке (было
+# ~120 МБ разом) и не больше девяти, добавлен прогресс и общий замок рендера.
 # 1.5.0: премиум-эмодзи из подарка — .giftemoji. Собирает статичный стикер
 # 512×512 (модель на прозрачном + мотив-силуэт), создаёт набор эмодзи на боте
 # через Bot API (без токена схема невозможна: владелец набора — всегда бот)
@@ -143,6 +150,7 @@ import math
 import os
 import re
 import subprocess
+import sys
 import shutil
 import tempfile
 import time
@@ -162,7 +170,7 @@ except Exception:  # pragma: no cover
     loader = utils = None
 
 
-MODULE_VERSION = "1.5.0"
+MODULE_VERSION = "1.5.1"
 
 INT64_MAX = 0x7FFFFFFFFFFFFFFF       # random_id в MTProto — знаковый int64
 
@@ -627,10 +635,12 @@ MAX_TILES = 9                      # максимум плиток в сетке
 BATCH_DELAY = 1.0                  # пауза между отправками, секунды
 CARD_W, CARD_H = 420, 280
 # --- премиум-эмодзи (статичные стикеры набора emojis=True) ---
-EMOJI_SIDE = 512                   # обязательная сторона стикера
-EMOJI_LIMIT = 512 * 1024           # сервер не примет файл больше 512 КБ
-EMOJI_BYTES = 480 * 1024           # с запасом: запас на повторное сжатие
-EMOJI_MAX = 120                    # столько стикеров влезает в набор
+EMOJI_SIDE = 512                   # обязательная сторона стикера, ровно 512
+EMOJI_BYTES = 480 * 1024           # сервер не примет больше 512 КБ, берём запас
+EMOJI_MAX = 120                    # статичных стикеров сервер держит до 120
+EMOJI_CREATE_BATCH = 50            # createNewStickerSet принимает до 50 за раз
+EMOJI_PREVIEW_MAX = 9              # больше плиток Telegram не примет как фото
+EMOJI_RESERVE_MB = 64              # запас памяти: ниже — превью не собираем
 EMOJI_PATTERN_ALPHA = 90           # прозрачность мотива-силуэта под моделью
 EMOJI_MODEL_INSET = 0.62           # тело модели = 62% стороны стикера
 EMOJI_STATE = ".giftemoji"         # файл-приглашение: имя → набор
@@ -2057,27 +2067,24 @@ def pattern_color_rgba(card: Card, alpha: int) -> tuple:
 
 
 def save_emoji_sticker(image: Image.Image, path: str) -> str:
-    """Статичный стикер: 512×512 RGBA, влезает в лимит сервера 512 КБ.
+    """Статичный стикер: ровно 512×512 RGBA в WEBP.
 
-    Формат PNG, а не WEBP: у PNG нет потерь на узоре и тексте, а при
-    512 px кадр весит ~80 КБ — до лимита остаётся шестикратный запас.
+    WEBP, а не PNG: это формат, который Telegram указывает в требованиях
+    к статичным стикерам. Сторона всегда 512 — если рендерить меньше и
+    потом тянуть вверх, стикер получается мыльным.
     """
-    tile = image.convert("RGBA").resize((EMOJI_SIDE, EMOJI_SIDE),
-                                        Image.Resampling.LANCZOS)
-    if tile.mode != "RGBA" or tile.getchannel("A").getextrema()[0] != 0:
-        # фон непрозрачный — стикер выглядел бы квадратом
-        logger.warning("gif: у эмодзи нет прозрачности, добавляю альфу")
-    target = _with_ext(path, ".png")
-    tile.save(target, "PNG", optimize=True)
-    size = os.path.getsize(target)
-    if size > EMOJI_BYTES:                     # PNG не влез — жмём в WEBP
-        webp = _with_ext(path, ".webp")
-        tile.save(webp, "WEBP", quality=92, method=4)
-        if os.path.getsize(webp) < size:
-            with contextlib.suppress(OSError):
-                os.unlink(target)
-            return webp
-    return target
+    tile = image.convert("RGBA")
+    if tile.size != (EMOJI_SIDE, EMOJI_SIDE):
+        tile = tile.resize((EMOJI_SIDE, EMOJI_SIDE), Image.Resampling.LANCZOS)
+    if tile.getchannel("A").getextrema()[0] != 0:
+        logger.warning("gif: у эмодзи нет прозрачности — стикер будет квадратом")
+    quality = 95
+    target = _with_ext(path, ".webp")
+    while True:
+        tile.save(target, "WEBP", quality=quality, method=6)
+        if os.path.getsize(target) <= EMOJI_BYTES or quality <= 70:
+            return target
+        quality -= 5
 
 
 def normalize_fmt(value, default: str = "gif") -> str:
@@ -2187,10 +2194,10 @@ GIFHELP_TEXT = """
 {star:} <b>Премиум-эмодзи из подарка</b>
 <code>.giftemoji</code> — реплаем на подарок
 <code>.giftemoji t.me/nft/gingercookie-89402</code> — ссылкой
-<blockquote>Собирает набор эмодзи (под 🎁) прямо на бота и присылает
-итоговую картинку. Нужен токен бота: <code>bot_token</code> в
-<code>.cfg GiftGif</code> или бот, привязанный к Hikka.
-Готовый набор открывается по ссылке <code>t.me/addemoji/…</code></blockquote>
+<blockquote>Набор <b>custom_emoji</b> на боте: стикеры 512×512, всегда под 🎁,
+до 120 в наборе, плюс итоговая картинка. Нужен токен бота:
+<code>bot_token</code> в <code>.cfg GiftGif</code> или бот, привязанный
+к Hikka. Готовый набор открывается ссылкой <code>t.me/addemoji/…</code></blockquote>
 
 {gear:} <b>Постоянные настройки</b> — <code>.cfg GiftGif</code>
 <code>format</code> — по умолчанию mp4 или gif
@@ -2601,8 +2608,8 @@ class GiftGif(loader.Module):
             return await self.say(message, emoji(
                 "{diamond:} <b>Премиум-эмодзи GiftGif</b>\n"
                 "Токен бота: " + ("✅ есть" if token else "❌ нет") + "\n"
-                "Токен берётся из <code>.cfg GiftGif</code> → "
-                "<code>bot_token</code> либо из бота, привязанного к Hikka.\n"
+                "Источник: " + ("поле <code>bot_token</code> или бот Hikka"
+                                if token else "ни поля, ни бота Hikka") + "\n"
                 "Собрать: <code>.giftemoji</code> реплаем на подарок или "
                 "<code>.giftemoji t.me/nft/…</code>"))
         token = self._emoji_token()
@@ -2617,85 +2624,148 @@ class GiftGif(loader.Module):
             return await self.say(message, emoji(
                 "{diamond:} <b>Эмодзи из подарка</b>\n"
                 "• Реплаем на подарок: <code>.giftemoji</code>\n"
-                "• Ссылкой: <code>.giftemoji t.me/nft/gingercookie-89402</code>\n"
-                "• Размер картинки: <code>.giftemoji 512</code>\n\n"
-                "Набор создаётся на бота, эмодзи — под 🎁. Готовый набор "
-                "открывается по ссылке <code>t.me/addemoji/…</code>"))
-        size = EMOJI_SIDE
-        for word in args.split():
-            if word.isdigit() and 100 <= int(word) <= 512:
-                size = int(word)
-        refs = refs[:EMOJI_MAX]
+                "• Ссылкой: <code>.giftemoji t.me/nft/gingercookie-89402</code>\n\n"
+                "Набор создаётся на боте, тип <code>custom_emoji</code>, "
+                "эмодзи 🎁. Готовый набор открывается ссылкой "
+                "<code>t.me/addemoji/…</code>"))
+        free = self._emoji_room()
+        refs = refs[:max(1, min(EMOJI_MAX, free))]
+        try:
+            bot_id = GiftGif._emoji_bot_id(token)
+        except RuntimeError as exc:
+            return await self.say(message, f"❌ {esc(exc)}")
         await self.say(message, "💎 Собираю эмодзи…" + (
             f" ({len(refs)} шт.)" if len(refs) > 1 else ""))
-        made, failures = [], []
-        token_ok = True
-        short_name = ""
-        for index, ref in enumerate(refs, 1):
-            try:
-                path = await self._emoji_build(ref, size)
-            except Exception as exc:                   # noqa: BLE001
-                failures.append(f"{esc(ref)}: {esc(exc)}")
-                continue
-            try:
-                with open(path, "rb") as handle:
-                    blob = handle.read()
-                if not short_name:
-                    short_name = self.emoji_short_name(resolve_slug(ref))
-                    await asyncio.get_running_loop().run_in_executor(
-                        None, lambda: GiftGif.api_sync(
-                            token, "createNewStickerSet", {
-                                "user_id": self._emoji_bot_id(token),
-                                "name": short_name,
-                                "title": "GiftGif"[:64],
-                                "stickers": json.dumps([{
-                                    "sticker": "attach://sticker",
-                                    "format": "static",
-                                    "emoji": "🎁",
-                                    "keywords": ["подарок", "gift"],
-                                }]),
-                            }, {"sticker": ("sticker.png", blob)}))
-                else:
-                    await asyncio.get_running_loop().run_in_executor(
-                        None, lambda: GiftGif.api_sync(
-                            token, "addStickerToSet", {
-                                "user_id": self._emoji_bot_id(token),
-                                "name": short_name,
-                                "sticker": json.dumps({
-                                    "sticker": "attach://sticker",
-                                    "format": "static",
-                                    "emoji": "🎁",
-                                }),
-                            }, {"sticker": ("sticker.png", blob)}))
-                made.append(ref)
-            except Exception as exc:                   # noqa: BLE001
-                failures.append(f"{esc(ref)}: {esc(exc)}")
-                token_ok = False
-            finally:
-                with contextlib.suppress(Exception):
-                    shutil.rmtree(os.path.dirname(path), ignore_errors=True)
-            if index < len(refs):
-                await asyncio.sleep(1.0)
-        if not made:
+        progress = {"at": time.time()}
+        made, failures, stickers = [], [], []
+        # рендер под общим замком, как у .gif: два тяжёлых кадра сразу
+        # удваивают память, а на хосте бота её и так немного
+        async with self._render_lock:
+            for index, ref in enumerate(refs, 1):
+                try:
+                    path = await self._emoji_build(ref)
+                except Exception as exc:               # noqa: BLE001
+                    failures.append(f"{esc(ref)}: {esc(exc)}")
+                    continue
+                try:
+                    with open(path, "rb") as handle:
+                        blob = handle.read()
+                    stickers.append((ref, blob))
+                finally:
+                    with contextlib.suppress(Exception):
+                        shutil.rmtree(os.path.dirname(path), ignore_errors=True)
+                # раз в несколько подарков обновляем служебное сообщение:
+                # 120 эмодзи собираются минутами, молчание выглядит как зависание
+                if len(refs) > 3 and (index % 5 == 0 or index == len(refs)) \
+                        and time.time() - progress["at"] > 2.5:
+                    progress["at"] = time.time()
+                    with contextlib.suppress(Exception):
+                        await utils.answer(message, "💎 Собираю эмодзи… "
+                                           f"{index}/{len(refs)}")
+                if index < len(refs):
+                    await asyncio.sleep(0.05)
+        if not stickers:
             report = "❌ Ни одного эмодзи не вышло."
             if failures:
                 report += "\n" + "\n".join(failures[:5])
             return await self.say(message, report)
+
+        # имя набора: получаем username бота, иначе сервер не примет имя
+        try:
+            me = await asyncio.get_running_loop().run_in_executor(
+                None, lambda: GiftGif.api_sync(token, "getMe", {}))
+            username = str(me.get("username") or "").strip()
+        except Exception as exc:                       # noqa: BLE001
+            return await self.say(
+                message, f"❌ Бот не ответил: {esc(exc)}\n"
+                         "Проверь <code>bot_token</code> в "
+                         "<code>.cfg GiftGif</code>.")
+        short_name = ""
+
+        def push(batch: list, first: bool) -> None:
+            """Одна пачка: первый вызов создаёт набор, дальше только добавить."""
+            files, items = {}, []
+            for index, (_ref, blob) in enumerate(batch):
+                key = "sticker%d" % index
+                files[key] = ("sticker%d.webp" % index, blob)
+                items.append({"sticker": "attach://" + key,
+                              "format": "static",
+                              "emoji_list": ["🎁"],
+                              "keywords": ["подарок", "gift"]})
+            if first:
+                GiftGif.api_sync(token, "createNewStickerSet", {
+                    "user_id": bot_id,
+                    "name": short_name,
+                    "title": "GiftGif подарки"[:64],
+                    "stickers": json.dumps(items),
+                    "sticker_type": "custom_emoji",
+                }, files)
+            else:
+                for index, item in enumerate(items):
+                    key = "sticker%d" % index
+                    GiftGif.api_sync(token, "addStickerToSet", {
+                        "user_id": bot_id,
+                        "name": short_name,
+                        "sticker": json.dumps(item),
+                    }, {key: files[key]})
+
+        first = stickers[:EMOJI_CREATE_BATCH]
+        rest = stickers[EMOJI_CREATE_BATCH:]
+        short_name = self.emoji_short_name(
+            resolve_slug(first[0][0]), username)
+        try:
+            await asyncio.get_running_loop().run_in_executor(
+                None, lambda: push(first, True))
+            made = [ref for ref, _blob in first]
+        except Exception as exc:                       # noqa: BLE001
+            # имя могло остаться за нами после частичного создания: пробуем
+            # ещё раз с новым хвостом, прежде чем сдаваться
+            short_name2 = self.emoji_short_name(
+                resolve_slug(first[0][0]), username)
+            try:
+                short_name = short_name2
+                await asyncio.get_running_loop().run_in_executor(
+                    None, lambda: push(first, True))
+                made = [ref for ref, _blob in first]
+            except Exception as exc2:                  # noqa: BLE001
+                return await self.say(message, emoji(
+                    "{warn:} Набор не создался: <code>" + esc(exc2) + "</code>\n"
+                    "Частая причина — нет Telegram Premium у владельца бота "
+                    "или бот не может создавать наборы."))
+        for start in range(0, len(rest), EMOJI_CREATE_BATCH):
+            batch = rest[start:start + EMOJI_CREATE_BATCH]
+            try:
+                await asyncio.get_running_loop().run_in_executor(
+                    None, lambda b=batch: push(b, False))
+                made.extend(ref for ref, _blob in batch)
+            except Exception as exc:                   # noqa: BLE001
+                failures.append(f"пачка {start // EMOJI_CREATE_BATCH + 2}: "
+                                f"{esc(exc)}")
+
         await self._drop(message)
-        preview, skipped = await self._emoji_preview(made, size)
         caption = (
             "{diamond:} <b>Набор премиум-эмодзи готов</b>\n"
             "Эмодзи: " + str(len(made)) + " · под 🎁\n"
             "Открыть: <code>t.me/addemoji/" + short_name + "</code>\n\n"
-            "Чтобы поставить в чате — открой набор и нажми «Добавить». "
-            "В сообщении он появится как обычный эмодзи 🎁.")
-        if failures and token_ok:
+            "Открой набор и нажми «Добавить» — в сообщении он появится "
+            "как обычный 🎁.")
+        if failures:
             caption += "\n\n⚠️ Не вышло: " + "; ".join(failures[:3])
-        elif failures:
-            caption += "\n\n⚠️ Ошибки: " + "; ".join(failures[:3])
+        try:
+            preview, skipped = await self._emoji_preview(made, EMOJI_SIDE)
+        except Exception as exc:                       # noqa: BLE001
+            logger.exception("gif: превью не собралось")
+            return await self.say(message, emoji(caption) + (
+                "\n\n<i>Превью не собралось: " + esc(exc) + "</i>"))
+        if skipped:
+            caption += "\n<i>В превью не попало: " + str(len(skipped)) + "</i>"
         await self._emoji_send(message, preview, emoji(caption))
         with contextlib.suppress(Exception):
             shutil.rmtree(os.path.dirname(preview), ignore_errors=True)
+
+    def _emoji_room(self) -> int:
+        """Сколько ещё эмодзи примет сервер: 120 — потолок статики."""
+        return EMOJI_MAX
 
     @staticmethod
     def _emoji_bot_id(token: str) -> int:
@@ -2970,23 +3040,36 @@ class GiftGif(loader.Module):
     # ---------- премиум-эмодзи: набор через Bot API ----------
 
     def _emoji_token(self) -> str:
-        """Токен бота: сначала поле в конфиге, потом токен инлайна Hikka.
+        """Токен бота: поле в конфиге, затем бот, привязанный к Hikka.
 
         Набор эмодзи создаётся от лица бота, поэтому нужен именно токен
-        бота. Своё поле — предсказуемый путь; хранилище Hikka читаем как
-        запасное, чтобы не требовать настройку там, где бот уже привязан.
+        бота. В Hikka база доступна как `self._db` (так делает штатный
+        eval.py); импорта `database` не существует, из-за него токен
+        всегда оказывался пустым.
         """
         own = str(self.get("bot_token", "") or "").strip()
         if own:
             return own
-        try:
-            from .. import database
-            token = database.db.get("hikka.inline", "bot_token", False)
+        for source in (getattr(self, "_db", None), self._loader_db()):
+            if source is None:
+                continue
+            try:
+                token = source.get("hikka.inline", "bot_token", False)
+            except Exception:                          # noqa: BLE001
+                continue
             if token:
                 return str(token).strip()
-        except Exception:                              # noqa: BLE001
-            pass
         return ""
+
+    @staticmethod
+    def _loader_db():
+        """Запасной путь: база из инлайна Hikka, если `self._db` не подставлен."""
+        for name in ("root.database", "hikka.database"):
+            module = sys.modules.get(name)
+            inner = getattr(module, "db", None) if module else None
+            if inner is not None:
+                return inner
+        return None
 
     @staticmethod
     def bot_api_sync(token: str, method: str, data: dict,
@@ -3004,9 +3087,13 @@ class GiftGif(loader.Module):
             body.write(("--%s\r\nContent-Disposition: form-data; name=\"%s\""
                         "\r\n\r\n%s\r\n" % (boundary, key, value)).encode())
         for key, (name, blob) in files.items():
+            # mime выводим из имени: сервер сверяет его с содержимым, а
+            # зашитый image/png при откате в .webp давал противоречие
+            mime = ("image/webp" if name.lower().endswith(".webp")
+                    else "image/png")
             body.write(("--%s\r\nContent-Disposition: form-data; name=\"%s\";"
-                        " filename=\"%s\"\r\nContent-Type: image/png"
-                        "\r\n\r\n" % (boundary, key, name)).encode())
+                        " filename=\"%s\"\r\nContent-Type: %s"
+                        "\r\n\r\n" % (boundary, key, name, mime)).encode())
             body.write(blob)
             body.write(b"\r\n")
         body.write(("--%s--\r\n" % boundary).encode())
@@ -3037,16 +3124,26 @@ class GiftGif(loader.Module):
         return result["result"]
 
     @staticmethod
-    def emoji_short_name(slug: str) -> str:
-        """Имя набора: латиница, цифры, подчёркивания, глобально уникальное.
+    def emoji_short_name(slug: str, username: str = "") -> str:
+        """Имя набора по правилам Bot API: gift_<slug>_<хвост>_by_<бот>.
 
-        Суффикс обязателен: имена заняты навсегда, второй вызов на тот же
-        подарок иначе получит «short name is occupied».
+        Требования сервера: только латиница, цифры и подчёркивания, первая
+        буква, без двойных подчёркиваний, и обязательно хвост
+        `_by_<username>` — без него createNewStickerSet отвечает отказом.
+        Случайный хвост нужен потому, что имена заняты навсегда.
         """
-        base = re.sub(r"[^a-z0-9_]+", "_", str(slug or "gift").lower())[:24]
+        base = re.sub(r"[^a-z0-9]+", "_", str(slug or "gift").lower())
+        base = re.sub(r"_{2,}", "_", base).strip("_")[:24] or "gift"
+        if not base[0].isalpha():
+            base = "gift_" + base
         tail = "".join(random.choice("abcdefghijklmnopqrstuvwxyz0123456789")
                        for _ in range(5))
-        return ("gift_%s_%s" % (base, tail)).strip("_")[:64]
+        name = re.sub(r"_{2,}", "_", "gift_%s_%s" % (base, tail)).strip("_")
+        if username:
+            suffix = "_by_" + re.sub(r"[^A-Za-z0-9_]+", "", str(username))
+            room = 64 - len(suffix)
+            return (name[:room].strip("_") + suffix)[:64]
+        return name[:64]
 
     async def _emoji_build(self, ref: str, size: int = EMOJI_SIDE) -> str:
         """Собрать картинку-эмодзи для одного подарка (в отдельном потоке)."""
@@ -3060,34 +3157,44 @@ class GiftGif(loader.Module):
         return await asyncio.get_running_loop().run_in_executor(None, work)
 
     async def _emoji_preview(self, refs: list, size: int) -> tuple:
-        """Итоговая картинка набора: те же эмодзи плитками по три в ряд."""
+        """Итоговая картинка набора: эмодзи плитками, не больше девяти.
+
+        Плитки собираются по одной и сразу вклеиваются в холст: держать
+        все слои в памяти нельзя — 120 кадров по 512 px это ~120 МБ, а на
+        хосте бота свободны десятки мегабайт.
+        """
+        refs = refs[:EMOJI_PREVIEW_MAX]
 
         def work() -> tuple:
-            layers, skipped = [], []
-            for ref in refs:
-                try:
-                    card, lottie, pattern = load_assets(ref)
-                    layers.append(emoji_layer(card, lottie, pattern, size))
-                except Exception as exc:               # noqa: BLE001
-                    skipped.append((ref, exc))
-            if not layers:
-                raise RuntimeError("ни один подарок не собрался")
-            per_row = 3 if len(layers) > 1 else 1
+            skip = max(0, len(refs) - EMOJI_PREVIEW_MAX)
+            per_row = 3 if len(refs) > 1 else 1
             gap = max(4, size // 32)
-            rows = math.ceil(len(layers) / per_row)
+            rows = math.ceil(len(refs) / per_row)
             sheet = Image.new("RGBA", (per_row * size + (per_row + 1) * gap,
                                        rows * size + (rows + 1) * gap),
                               (16, 16, 16, 255))
-            for index, layer in enumerate(layers):
-                row, col = divmod(index, per_row)
+            drawn, skipped = 0, []
+            for ref in refs:
+                try:
+                    card, lottie, pattern = load_assets(ref)
+                    layer = emoji_layer(card, lottie, pattern, size)
+                except Exception as exc:               # noqa: BLE001
+                    skipped.append((ref, exc))
+                    continue
+                row, col = divmod(drawn, per_row)
                 cell = Image.new("RGBA", (size, size), (30, 30, 34, 255))
                 cell.alpha_composite(layer)
+                del layer
                 sheet.alpha_composite(cell, (gap + col * (size + gap),
                                              gap + row * (size + gap)))
+                drawn += 1
+            if not drawn:
+                raise RuntimeError("ни один подарок не собрался")
             folder = tempfile.mkdtemp(prefix="giftgif-")
             target = os.path.join(folder, "preview.png")
             sheet.convert("RGB").save(target, "PNG", optimize=True)
-            return target, skipped
+            return target, skipped + ([("ещё %d" % skip, "не влезли в превью")]
+                                      if skip else [])
 
         return await asyncio.get_running_loop().run_in_executor(None, work)
 
