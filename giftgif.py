@@ -1,7 +1,7 @@
 # ◇━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━◇
 # meta developer: @n3post
 # scope: Heroku, Hikka
-# version: 1.5.2
+# version: 1.5.3
 # author: n3
 # Description: Подарок Telegram → анимированная карточка GIF или MP4.
 # Собирает ту же карточку, что показывает приложение: градиентный фон,
@@ -18,6 +18,13 @@
 # плитку, нижний ряд включён) — в 1.4.5 низ плитки оставался пустым.
 # 1.4.9: команда .giftest — проверка на трёх печеньках: узор по третям,
 # габарит модели, живая ли анимация, плюс скриншот кадра в чат.
+# 1.5.3: токен бота ищется по смыслу, а не по точному совпадению.
+# Токен вытаскивается регуляркой из любой строки (вставили текст из
+# BotFather с лишними строками), из списка и из словаря. Валидатор поля
+# теперь с откатом на String: Hidden есть не во всех сборках Hikka, и на
+# старой loader.validators.Hidden ронял импорт всего модуля.
+# Новая команда .giftemoji_diag показывает, что модуль реально видит в
+# настройках: значение config, базу, токен живого бота и итог.
 # 1.5.2: настройки из .cfg больше не теряются. В Hikka self.get() читает
 # базу под именем класса, а не конфиг, поэтому bot_token, вписанный в
 # .cfg GiftGif, возвращал пустую строку — команда всегда просила токен.
@@ -177,7 +184,7 @@ except Exception:  # pragma: no cover
     loader = utils = None
 
 
-MODULE_VERSION = "1.5.2"
+MODULE_VERSION = "1.5.3"
 
 INT64_MAX = 0x7FFFFFFFFFFFFFFF       # random_id в MTProto — знаковый int64
 
@@ -2304,7 +2311,10 @@ class GiftGif(loader.Module):
                 "bot_token", "",
                 "Токен бота для набора премиум-эмодзи (.giftemoji). "
                 "Пусто — берётся токен бота, привязанного к Hikka",
-                validator=loader.validators.Hidden(),
+                # Hidden появился не во всех сборках Hikka: на старых
+                # loader.validators.Hidden отсутствует, и модуль не грузился
+                validator=getattr(loader.validators, "Hidden",
+                                  loader.validators.String)(),
             ),
             loader.ConfigValue(
                 "cache_minutes", 30,
@@ -2770,6 +2780,43 @@ class GiftGif(loader.Module):
         with contextlib.suppress(Exception):
             shutil.rmtree(os.path.dirname(preview), ignore_errors=True)
 
+    @loader.command()
+    async def giftemoji_diag(self, message):
+        """| диагностика премиум-эмодзи: что видит модуль в настройках"""
+        lines = ["🔬 <b>Диагностика .giftemoji</b>"]
+
+        def show(label, value):
+            if isinstance(value, str):
+                shown = (value[:4] + "…" + value[-4:]) if len(value) > 10 else value
+                lines.append("%s: <code>%s</code> (строка, %d симв.)"
+                             % (label, esc(shown) or "пусто", len(value)))
+            elif isinstance(value, (list, tuple, dict)):
+                shown = json.dumps(value, ensure_ascii=False)[:80]
+                lines.append("%s: <code>%s</code> (%s, %d элем.)"
+                             % (label, esc(shown), type(value).__name__, len(value)))
+            else:
+                lines.append("%s: <code>%s</code> (%s)"
+                             % (label, esc(str(value)), type(value).__name__))
+
+        try:
+            raw = self.config["bot_token"]
+        except Exception as exc:                       # noqa: BLE001
+            raw = "<нет доступа: %s>" % exc
+        show("config[bot_token]", raw)
+        show("_conf(bot_token)", self._conf("bot_token", ""))
+        show("get(bot_token)", self.get("bot_token", ""))
+        client = getattr(self, "client", None) or getattr(self, "_client", None)
+        inline = getattr(client, "hikka_inline", None) if client else None
+        show("inline._token", getattr(inline, "_token", None) if inline else None)
+        show("итоговый токен", self._emoji_token() or "НЕ НАЙДЕН")
+        try:
+            rows = [f"{k}={v!r}" for k, v in self.config.items()]
+            lines.append("весь config: <code>" + esc(", ".join(rows))[:600] + "</code>")
+        except Exception as exc:                       # noqa: BLE001
+            lines.append("config не читается: " + esc(str(exc)))
+        lines.append("версия модуля: <code>" + MODULE_VERSION + "</code>")
+        return await self.say(message, "\n".join(lines))
+
     def _emoji_room(self) -> int:
         """Сколько ещё эмодзи примет сервер: 120 — потолок статики."""
         return EMOJI_MAX
@@ -3081,7 +3128,7 @@ class GiftGif(loader.Module):
         eval.py); импорта `database` не существует, из-за него токен
         всегда оказывался пустым.
         """
-        own = str(self._conf("bot_token", "") or "").strip()
+        own = self._token_from(("bot_token",))
         if own:
             return own
         # бот Hikka: токен в базе. Если бот уже поднят, но токен в базе не
@@ -3107,8 +3154,50 @@ class GiftGif(loader.Module):
         client = getattr(self, "client", None) or getattr(self, "_client", None)
         inline = getattr(client, "hikka_inline", None) if client else None
         token = getattr(inline, "_token", None) if inline else None
-        if token and isinstance(token, str) and ":" in token:
-            return token.strip()
+        if token:
+            found = self._dig_token(token)
+            if found:
+                return found
+        return ""
+
+    @staticmethod
+    def _dig_token(value) -> str:
+        """Найти токен вида 123456789:AA… внутри строки, списка или словаря.
+
+        Пользователь может вставить токен с лишним текстом (например,
+        строкой из BotFather), а конфиг может хранить его списком —
+        поэтому не полагаемся на точное совпадение строки.
+        """
+        pattern = re.compile(r"\b(\d{5,15}:[A-Za-z0-9_-]{20,})\b")
+        stack = [value]
+        seen = 0
+        while stack and seen < 50:
+            item = stack.pop()
+            seen += 1
+            if isinstance(item, str):
+                found = pattern.search(item)
+                if found:
+                    return found.group(1).strip()
+            elif isinstance(item, dict):
+                stack.extend(item.values())
+            elif isinstance(item, (list, tuple, set)):
+                stack.extend(item)
+        return ""
+
+    def _token_from(self, keys) -> str:
+        """Перебрать настройки и вернуть первый настоящий токен.
+
+        Без разбора строки: если конфиг хранит токен списком (так бывает,
+        когда валидатор просит строку, а поле заполнили циклом), простая
+        проверка «не пусто» давала ложное «токен есть».
+        """
+        for key in keys:
+            value = self._conf(key, "")
+            found = self._dig_token(value)
+            if found:
+                return found
+            if isinstance(value, str) and ":" in value and len(value) > 20:
+                return value.strip()
         return ""
 
     @staticmethod
