@@ -1,7 +1,7 @@
 # ◇━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━◇
 # meta developer: @n3post
 # scope: Heroku, Hikka
-# version: 1.5.1
+# version: 1.5.2
 # author: n3
 # Description: Подарок Telegram → анимированная карточка GIF или MP4.
 # Собирает ту же карточку, что показывает приложение: градиентный фон,
@@ -18,6 +18,13 @@
 # плитку, нижний ряд включён) — в 1.4.5 низ плитки оставался пустым.
 # 1.4.9: команда .giftest — проверка на трёх печеньках: узор по третям,
 # габарит модели, живая ли анимация, плюс скриншот кадра в чат.
+# 1.5.2: настройки из .cfg больше не теряются. В Hikka self.get() читает
+# базу под именем класса, а не конфиг, поэтому bot_token, вписанный в
+# .cfg GiftGif, возвращал пустую строку — команда всегда просила токен.
+# Теперь _conf() смотрит сначала .cfg, потом базу, а .gifttext пишет в оба
+# места. Туда же caption: раньше .gifttext и status читали только базу,
+# и подпись могла «не находиться». Токен живого бота Hikka читается ещё и
+# из инлайн-менеджера — в некоторых ветках он не попадает в базу.
 # 1.5.1: .giftemoji починен целиком. Токен бота читался не оттуда: Hikka
 # держит базу в self._db, а несуществующий импорт database молча глотал
 # ошибку — из-за этого команда всегда просила токен. Набор создавался как
@@ -170,7 +177,7 @@ except Exception:  # pragma: no cover
     loader = utils = None
 
 
-MODULE_VERSION = "1.5.1"
+MODULE_VERSION = "1.5.2"
 
 INT64_MAX = 0x7FFFFFFFFFFFFFFF       # random_id в MTProto — знаковый int64
 
@@ -2369,7 +2376,7 @@ class GiftGif(loader.Module):
                     "✅" if have_lottie else "❌ нет",
                     "✅" if have_ffmpeg else "❌ нет",
                     MAX_BATCH, MAX_TILES,
-                    esc(str(self.get("caption", "") or "")) or "—",
+                    esc(str(self._conf("caption", "") or "")) or "—",
                     "да" if self.config["card_caption"] else "нет",
                     "да" if self.config["file_caption"] else "нет",
                     self.config["pattern"], MODULE_VERSION, size_note)
@@ -2460,14 +2467,14 @@ class GiftGif(loader.Module):
         """| подпись под карточкой: .gifttext С Новым годом! · .gifttext — убрать"""
         raw = (utils.get_args_raw(message) or "").strip()
         if not raw or raw.lower() in ("сброс", "убрать", "clear", "-"):
-            self.set("caption", "")
+            self._conf_set("caption", "")
             return await self.say(
                 message, "🧹 Свой текст убран — будет только название и номер.")
         if len(raw) > 200:
             return await self.say(
                 message, f"❌ Слишком длинно ({len(raw)} символов, максимум 200)."
                 )
-        self.set("caption", raw)
+        self._conf_set("caption", raw)
         on_card = bool(self.config["card_caption"])
         in_file = bool(self.config["file_caption"])
         where = ("на карточке и под файлом" if on_card and in_file else
@@ -2885,13 +2892,13 @@ class GiftGif(loader.Module):
         """Своя подпись для карточки; card_caption=False убирает её из кадра."""
         if not self.config["card_caption"]:
             return ""
-        return str(self.get("caption", "") or "")
+        return str(self._conf("caption", "") or "")
 
     def _base_caption(self, detail: str) -> str:
         """Подпись к файлу в чате; выключается настройкой file_caption."""
         if not self.config["file_caption"]:
             return ""
-        own = str(self.get("caption", "") or "")
+        own = str(self._conf("caption", "") or "")
         return (emoji(esc(own)) + "\n" if own else "") + emoji(detail)
 
     @staticmethod
@@ -3037,6 +3044,33 @@ class GiftGif(loader.Module):
                              "(без подписи, файлом)")
             return None
 
+    def _conf(self, key: str, default=None):
+        """Значение настройки GiftGif: сначала `.cfg`, потом база модуля.
+
+        Два хранилища — не ошибка, так устроена Hikka: поля из `.cfg`
+        лежат в `self.config`, а `self.set()` пишет в базу под именем
+        класса. `self.get()` возвращает только второе, поэтому `bot_token`,
+        заполненный в `.cfg`, читался как пустая строка.
+        """
+        try:
+            value = self.config[key]
+        except Exception:                              # noqa: BLE001
+            value = None
+        if value not in (None, ""):
+            return value
+        try:
+            stored = self.get(key, default)
+        except Exception:                              # noqa: BLE001
+            stored = None
+        return default if stored is None else stored
+
+    def _conf_set(self, key: str, value) -> None:
+        """Записать настройку и в конфиг, и в базу — чтобы не разъезжались."""
+        with contextlib.suppress(Exception):
+            self.config[key] = value
+        with contextlib.suppress(Exception):
+            self.set(key, value)
+
     # ---------- премиум-эмодзи: набор через Bot API ----------
 
     def _emoji_token(self) -> str:
@@ -3047,9 +3081,11 @@ class GiftGif(loader.Module):
         eval.py); импорта `database` не существует, из-за него токен
         всегда оказывался пустым.
         """
-        own = str(self.get("bot_token", "") or "").strip()
+        own = str(self._conf("bot_token", "") or "").strip()
         if own:
             return own
+        # бот Hikka: токен в базе. Если бот уже поднят, но токен в базе не
+        # сохранён, забираем его из живого объекта инлайна
         for source in (getattr(self, "_db", None), self._loader_db()):
             if source is None:
                 continue
@@ -3059,6 +3095,20 @@ class GiftGif(loader.Module):
                 continue
             if token:
                 return str(token).strip()
+        return self._inline_token()
+
+    def _inline_token(self) -> str:
+        """Токен уже запущенного бота Hikka, если в базе его нет.
+
+        В Hikka инлайн-менеджер держит токен в `self._token`, а в базу
+        пишет не во всех ветках (при создании бота через BotFather он
+        остаётся только в памяти), поэтому читаем оба места.
+        """
+        client = getattr(self, "client", None) or getattr(self, "_client", None)
+        inline = getattr(client, "hikka_inline", None) if client else None
+        token = getattr(inline, "_token", None) if inline else None
+        if token and isinstance(token, str) and ":" in token:
+            return token.strip()
         return ""
 
     @staticmethod
