@@ -1,7 +1,7 @@
 # ◇━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━◇
 # meta developer: @n3post
 # scope: Heroku, Hikka
-# version: 1.6.2
+# version: 1.6.3
 # author: n3
 # Description: Подарок Telegram → анимированная карточка GIF или MP4.
 # Собирает ту же карточку, что показывает приложение: градиентный фон,
@@ -18,6 +18,15 @@
 # плитку, нижний ряд включён) — в 1.4.5 низ плитки оставался пустым.
 # 1.4.9: команда .giftest — проверка на трёх печеньках: узор по третям,
 # габарит модели, живая ли анимация, плюс скриншот кадра в чат.
+# 1.6.3: .giftemoji собирает пачку сама — набор на каждый подарок.
+# Несколько ссылок в одной команде или целая коллекция (@username,
+# t.me/a/<имя>): команда по очереди делает набор на каждый подарок, ведёт
+# один прогресс-бар и в конце отдаёт список ссылок t.me/addemoji/…, а
+# сбой одного набора не роняет остальные и называется в отчёте. За запуск
+# до 10 наборов — коллекции бывают на сотни подарков. Карточка для набора
+# теперь рендерится с запасом 1.5 над сеткой и кусок режется из него:
+# раньше карточка была 512 px, кусок выходил 64 px и растягивался до 100 —
+# контур модели шёл лестницей.
 # 1.6.2: убран огромный силуэт за моделью и появился отчёт о работе.
 # Силуэт рисовался дважды: узор уже есть в самой плитке, а сверху
 # накладывался ещё один крупный мотив — отсюда «пятно» за пряником.
@@ -217,7 +226,7 @@ except Exception:  # pragma: no cover
     loader = utils = None
 
 
-MODULE_VERSION = "1.6.2"
+MODULE_VERSION = "1.6.3"
 
 INT64_MAX = 0x7FFFFFFFFFFFFFFF       # random_id в MTProto — знаковый int64
 
@@ -686,8 +695,11 @@ CARD_W, CARD_H = 420, 280
 # С 512×512 createNewStickerSet отвечает STICKER_PNG_DIMENSIONS: 512 — это
 # размер обычных стикеров, у custom_emoji своя сетка.
 EMOJI_SIDE = 100                   # сторона картинки-эмодзи, ровно 100
-EMOJI_RENDER = 512                 # из такого размера ужимаем в 100: с 512
-                                   # картинка остаётся резкой, с 100 — мыло
+EMOJI_RENDER = 1.5                 # запас рендера над сеткой: 800 × 1.5 =
+                                   # 1225. Куски режутся из него и ужимаются до
+                                   # 100, поэтому контур модели вдвое чище, чем
+                                   # при рендере «пиксель в пиксель» (замер:
+                                   # ошибка на контуре 4.75 → 2.59)
 EMOJI_PREVIEW_SIDE = 512           # превью набора — обычное фото, не эмодзи
 EMOJI_BYTES = 480 * 1024           # сервер не примет больше 512 КБ, берём запас
 EMOJI_MAX = 120                    # статичных стикеров сервер держит до 120
@@ -705,6 +717,9 @@ EMOJI_ROWS = 8                     # кусков по вертикали
 EMOJI_GRID_MAX = 10                # 10×10 = 100, потолок набора — 120
 EMOJI_EMOJI = "🎁"                 # под каким эмодзи лежит кусок
 EMOJI_STATE = ".giftemoji"         # файл-приглашение: имя → набор
+EMOJI_BATCH_MAX = 10              # наборов за один запуск: коллекция
+                                  # бывает на сотни подарков, и это
+                                  # часы работы и мегабайты в чате
 GRID_GAP = 0.03                    # зазор между плитками в сетке
 GRID_MARGIN = 0.03                 # поле страницы сетки          # координаты SVG карточки Telegram
 CARD_RADIUS = 46                   # скругление «плитки» в приложении
@@ -2182,6 +2197,11 @@ def slice_picture(sheet: Image.Image, folder: str,
             left = round(width * col / cols)
             right = round(width * (col + 1) / cols)
             piece = sheet.crop((left, top, right, bottom))
+            if piece.size != (EMOJI_SIDE, EMOJI_SIDE):
+                # кусок вырезан из рендера с запасом и ужимается до 100 —
+                # один общий ресайз на кусок, а не растяжение из 64 px
+                piece = piece.resize((EMOJI_SIDE, EMOJI_SIDE),
+                                     Image.Resampling.LANCZOS)
             path = os.path.join(folder, "piece-%d-%d" % (row, col))
             paths.append(save_emoji_sticker(piece, path, lossless=True))
     return paths
@@ -2328,6 +2348,11 @@ GIFHELP_TEXT = """
 <code>.gif</code>
 Или списком ссылок:
 <code>.gif t.me/nft/x-1 t.me/nft/y-2 t.me/nft/z-3</code>
+
+{star:} <b>Премиум-эмодзи — набор на каждый подарок</b>
+<code>.giftemoji t.me/nft/x-1 t.me/nft/y-2</code> — два набора за раз
+<code>.giftemoji @username</code> — вся коллекция, по набору на подарок
+<blockquote>За запуск до 10 наборов, прогресс и все ссылки приходят в чат</blockquote>
 <blockquote>До 10 за раз, карточки уходят по очереди с паузой в секунду — так Telegram не режет отправку</blockquote>
 
 {chart:} <b>Сетка — все подарки в одном видео</b>
@@ -2545,6 +2570,13 @@ class GiftGif(loader.Module):
         """Все подарки: список ссылок в команде и/или пачка в реплае."""
         text = args or ""
         refs = re.findall(r"t\.me/nft/[A-Za-z0-9_-]+", text)
+        # @username и t.me/a/<username> — чужая коллекция: разворачиваем
+        if not refs:
+            for name in re.findall(r"(?<![\w/])@([A-Za-z0-9_]{3,32})\b", text):
+                refs.extend(await self.collection_slugs(message, name))
+            for name in re.findall(r"t\.me/(?:a|addemoji)/([A-Za-z0-9_]{3,32})",
+                                   text):
+                refs.extend(await self.collection_slugs(message, name))
         if not refs:
             # слова-команды («сетка», «видео», «gif») подарком не считаем
             words = [w for w in text.split()
@@ -2572,6 +2604,73 @@ class GiftGif(loader.Module):
         unique = []
         for ref in refs:
             if ref and ref not in unique:
+                unique.append(ref)
+        return unique
+
+    async def collection_slugs(self, message, name: str) -> list:
+        """Подарки из чужой коллекции: t.me/a/<username> или @username.
+
+        Telegram отдаёт коллекцию сущностью (её же открывает ссылка), а
+        список подарков в ней — полем `gifts` у результата. Если собрать
+        не удалось, возвращаем пусто: команда скажет об этом, а не будет
+        молча ничего делать.
+        """
+        username = str(name or "").lstrip("@").strip()
+        if not username:
+            return []
+        client = getattr(message, "client", None) or getattr(self, "client", None)
+        if client is None:
+            return []
+        try:
+            from hikkatl.tl.functions.contacts import ResolveUsernameRequest
+        except Exception:                              # noqa: BLE001
+            return []
+        try:
+            entity = await client(ResolveUsernameRequest(username=username))
+        except Exception:                              # noqa: BLE001
+            logger.debug("gif: коллекция @%s не открылась", username)
+            return []
+        found = []
+        for holder in (entity, getattr(entity, "peer", None),
+                       getattr(entity, "user", None),
+                       getattr(entity, "chat", None)):
+            if holder is None:
+                continue
+            # у коллекции подарков бывает свой slug
+            slug = getattr(holder, "slug", None)
+            if slug:
+                found.append(str(slug))
+            gifts = getattr(holder, "gifts", None)
+            if isinstance(gifts, (list, tuple)):
+                for gift in gifts:
+                    item = str(getattr(gift, "slug", "") or "")
+                    if item:
+                        found.append(item)
+        return [item for item in dict.fromkeys(found) if item]
+
+    def emoji_batch_refs(self, args: str) -> list:
+        """Подарки для .giftemoji пачкой: ссылки и @username в аргументах.
+
+        `@durov` — это чужая коллекция: по ней команда собирает набор для
+        каждого подарка сама, без запуска на каждый подарок руками.
+        """
+        text = args or ""
+        refs = []
+        for found in re.finditer(r"t\.me/nft/([A-Za-z0-9_-]+)", text):
+            refs.append("t.me/nft/" + found.group(1))
+        for name in re.findall(r"(?<![\w/])@([A-Za-z0-9_]{3,32})\b", text):
+            refs.append("@" + name)
+        # t.me/a/<name> и t.me/addemoji/<name> — тоже коллекция
+        for name in re.findall(
+                r"t\.me/(?:a|addemoji)/([A-Za-z0-9_]{3,32})", text):
+            refs.append("@" + name)
+        # и просто t.me/<name>, но не служебные пути
+        for name in re.findall(r"(?<![/\w])t\.me/([A-Za-z0-9_]{3,32})\b", text):
+            if name not in ("nft", "a", "addemoji", "addstickers", "s"):
+                refs.append("@" + name)
+        unique = []
+        for ref in refs:
+            if ref not in unique:
                 unique.append(ref)
         return unique
 
@@ -2761,30 +2860,156 @@ class GiftGif(loader.Module):
 
     @loader.command()
     async def giftemoji(self, message):
-        """| премиум-эмодзи из подарка: .giftemoji реплаем или ссылкой"""
+        """| премиум-эмодзи из подарка: .giftemoji реплаем, ссылкой, @коллекцией"""
         args = (utils.get_args_raw(message) or "").strip()
         if args.lower() in ("статус", "status", "?"):
-            token = self._emoji_token()
-            return await self.say(message, emoji(
-                "{diamond:} <b>Премиум-эмодзи GiftGif</b>\n"
-                "Токен бота: " + ("✅ есть" if token else "❌ нет") + "\n"
-                "Источник: " + ("поле <code>bot_token</code> или бот Hikka"
-                                if token else "ни поля, ни бота Hikka") + "\n"
-                "Собрать: <code>.giftemoji</code> реплаем на подарок или "
-                "<code>.giftemoji t.me/nft/…</code>"))
+            return await self._emoji_status(message)
+        batch = self.emoji_batch_refs(args)
+        # Несколько подарков или целая коллекция: набор на каждый подарок
+        # собирается сам, без запуска команды руками по одному.
+        if batch:
+            return await self._emoji_batch(message, args, batch)
+        return await self._emoji_single(message, args)
+
+    async def _emoji_batch(self, message, args: str, wanted: list) -> None:
+        """Набор на каждый подарок — сам, подряд, без ручного запуска.
+
+        `.giftemoji @durov` разворачивает коллекцию, `.giftemoji <ссылка>
+        <ссылка> …` собирает по каждому. Один прогресс-бар на всю пачку и
+        общий итог: сколько наборов вышло, сколько нет и почему.
+        """
+        head = await self.say_head(message, "💎 Готовлю пачку…")
         token = self._emoji_token()
         if not token:
-            return await self.say(message, emoji(
-                "{warn:} Нужен токен бота: без него набор эмодзи создать "
-                "нельзя — его владелец всегда бот.\n"
-                "Впиши в <code>.cfg GiftGif</code> → <code>bot_token</code> "
-                "или привяжи бота к Hikka и повтори."))
-        refs = await self.gift_refs(message, args)
+            return await self.say_update(
+                head, message, emoji(
+                    "{warn:} Нужен токен бота: впиши в "
+                    "<code>.cfg GiftGif</code> → <code>bot_token</code>."))
+
+        plain = [item for item in wanted if not item.startswith("@")]
+        if len(wanted) == 1 and plain:
+            # один подарок — обычный путь: с превью и подробным отчётом
+            with contextlib.suppress(Exception):
+                await head.delete()
+            return await self._emoji_single(message, plain[0])
+        # разворачиваем коллекции в список подарков
+        refs = []
+        problems = []
+        for item in wanted:
+            if item.startswith("@"):
+                found = await self.collection_slugs(message, item)
+                if not found:
+                    problems.append("%s: коллекция не открылась" % esc(item))
+                    continue
+                refs.extend(found)
+            else:
+                refs.append(item)
+        refs = list(dict.fromkeys(refs))
+        cut = 0
+        if len(refs) > EMOJI_BATCH_MAX:
+            # коллекция может быть на сотни подарков: пачка не должна
+            # тянуться часами, остаток прямо назван в отчёте
+            cut = len(refs) - EMOJI_BATCH_MAX
+            refs = refs[:EMOJI_BATCH_MAX]
         if not refs:
+            return await self.say_update(
+                head, message, emoji(
+                    "{warn:} Не нашёл подарков.\n"
+                    + ("\n".join(problems[:5]) + "\n\n" if problems else "")
+                    + "Ссылка: <code>.giftemoji t.me/nft/…</code>\n"
+                    "Коллекция: <code>.giftemoji @username</code>"))
+
+        made, failed = [], list(problems)
+        started = time.time()
+        for index, ref in enumerate(refs, 1):
+            await self.say_update(
+                head, message,
+                "💎 Набор %d из %d · %s…" % (index, len(refs), esc(ref)[:44]))
+            try:
+                one = await self._emoji_single(message, ref, quiet=True)
+            except Exception as exc:                   # noqa: BLE001
+                failed.append("%s: %s" % (esc(ref), esc(exc)))
+                continue
+            if one and not str(one).startswith("!"):
+                made.append((ref, one))
+            else:
+                # `_emoji_single` сам объяснил причину — показываем её,
+                # иначе в отчёте набор просто исчезал без следа
+                reason = str(one)[1:] if one else "набор не создался"
+                failed.append("%s: %s" % (esc(ref), esc(reason)))
+
+        if not made:
+            return await self.say_update(
+                head, message, emoji(
+                    "{warn:} Ни один набор не собрался.\n"
+                    + "\n".join(failed[:5])))
+
+        lines = ["{diamond:} <b>Готово: наборов " + str(len(made))
+                 + "</b> · %.0f с" % (time.time() - started)]
+        for ref, short in made:
+            lines.append("• <code>t.me/addemoji/" + short + "</code>")
+        if cut:
+            lines.append("<i>Осталось %d: повтори команду, соберутся "
+                         "следующие %d</i>" % (cut, EMOJI_BATCH_MAX))
+        if failed:
+            lines.append("")
+            lines.append("{warn:} Не вышло: " + "; ".join(failed[:4])
+                         + (" и ещё %d" % (len(failed) - 4)
+                            if len(failed) > 4 else ""))
+        return await self.say_update(head, message, emoji("\n".join(lines)))
+
+    async def _emoji_status(self, message):
+        """Короткая сводка: есть ли токен и как запускать."""
+        token = self._emoji_token()
+        return await self.say(message, emoji(
+            "{diamond:} <b>Премиум-эмодзи GiftGif</b>\n"
+            "Токен бота: " + ("✅ есть" if token else "❌ нет") + "\n"
+            "Источник: " + ("поле <code>bot_token</code> или бот Hikka"
+                            if token else "ни поля, ни бота Hikka") + "\n"
+            "Собрать: <code>.giftemoji</code> реплаем на подарок, "
+            "<code>.giftemoji t.me/nft/…</code> или "
+            "<code>.giftemoji @коллекция</code> — набор на каждый подарок"))
+
+    async def _emoji_single(self, message, args: str = "",
+                            quiet: bool = False):
+        """Один набор из подарков, найденных в сообщении/реплае.
+
+        `quiet` — режим пачки: свой прогресс-бар и отчёт ведёт вызывающий,
+        поэтому в чат ничего не пишем. Возвращает имя набора, а при
+        проблеме строку с «!» в начале — по ней вызывающий понимает причину.
+        """
+        refs_override = None
+        if quiet and args:
+            # в режиме пачки аргумент — это уже готовый подарок
+            refs_override = [args]
+
+        def bad(reason: str):
+            """Причина сбоя: в пачке возвращаем текстом, иначе пишем в чат."""
+            if quiet:
+                return "!" + reason
+            return None
+
+        async def explain(reason: str):
+            """Одна и та же причина — в чат или вызывающему."""
+            if quiet:
+                return "!" + reason
+            await self.say(message, emoji(reason))
+            return None
+
+        token = self._emoji_token()
+        if not token:
+            return await explain(
+                "{warn:} Нужен токен бота: впиши в "
+                "<code>.cfg GiftGif</code> → <code>bot_token</code>.")
+        refs = refs_override or await self.gift_refs(message, args)
+        if not refs:
+            if quiet:
+                return "!подарок не распознан"
             return await self.say(message, emoji(
                 "{diamond:} <b>Эмодзи из подарка</b>\n"
                 "• Реплаем на подарок: <code>.giftemoji</code>\n"
-                "• Ссылкой: <code>.giftemoji t.me/nft/gingercookie-89402</code>\n\n"
+                "• Ссылкой: <code>.giftemoji t.me/nft/gingercookie-89402</code>\n"
+                "• Коллекцией: <code>.giftemoji @username</code>\n\n"
                 "Набор создаётся на боте, тип <code>custom_emoji</code>, "
                 "эмодзи 🎁. Готовый набор открывается ссылкой "
                 "<code>t.me/addemoji/…</code>"))
@@ -2795,28 +3020,31 @@ class GiftGif(loader.Module):
         # Bot API отвечает USER_IS_BOT: набором владеет бот, а не человек.
         owner_id = self._emoji_owner_id()
         if not owner_id:
-            return await self.say(message, emoji(
+            return await explain(
                 "{warn:} Не понял, на кого создавать набор: нужен твой "
-                "Telegram ID.\nВпиши его в <code>.cfg GiftGif</code> → "
-                "<code>owner_id</code> (узнать: <code>.giftemoji_diag</code>)."))
+                "Telegram ID. Впиши в <code>.cfg GiftGif</code> → "
+                "<code>owner_id</code>.")
         try:
             bot_id = GiftGif._emoji_bot_id(token)
         except RuntimeError as exc:
-            return await self.say(message, f"❌ {esc(exc)}")
+            return bad("токен бота выглядит неверно") if quiet else \
+                await self.say(message, f"❌ {esc(exc)}")
         if owner_id == bot_id:
-            return await self.say(message, emoji(
+            return await explain(
                 "{warn:} Владельцем набора указан сам бот (id "
                 + str(bot_id) + ") — Bot API так не умеет и ответит "
-                "USER_IS_BOT.\nВ <code>owner_id</code> нужен твой личный ID, "
-                "а не бота."))
+                "USER_IS_BOT. В <code>owner_id</code> нужен твой личный ID, "
+                "а не бота.")
         started = time.time()
         cols, rows = self._emoji_grid(len(refs))
         total = len(refs) * cols * rows
         # Своё сообщение под прогресс, а не общее .say: раньше проценты
         # уходили в ответ на команду и затирали друг друга, а после
         # удаления команды в чате не оставалось вообще ничего.
-        head = await self.say_head(
-            message, "💎 Режу карточку на куски… (0/%d)" % total)
+        head = None
+        if not quiet:
+            head = await self.say_head(
+                message, "💎 Режу карточку на куски… (0/%d)" % total)
         progress = {"at": time.time(), "head": head, "stage": "cut"}
         made, failures, stickers = [], [], []
         built = []
@@ -2843,16 +3071,18 @@ class GiftGif(loader.Module):
                         shutil.rmtree(folder, ignore_errors=True)
                 # прогресс после КАЖДОЙ карточки: рендер одной занимает
                 # несколько секунд, и без правок чат выглядит зависшим
-                await self.say_update(
-                    head, message,
-                    "💎 Режу карточку на куски… %d/%d" % (len(stickers), total))
+                if not quiet:
+                    await self.say_update(
+                        head, message, "💎 Режу карточку на куски… %d/%d"
+                        % (len(stickers), total))
                 if index < len(refs):
                     await asyncio.sleep(0.05)
         if not stickers:
             report = "❌ Ни одного эмодзи не вышло."
             if failures:
                 report += "\n" + "\n".join(failures[:5])
-            return await self.say(message, report)
+            return await explain(report) if quiet else \
+                await self.say(message, report)
 
         # имя набора: получаем username бота, иначе сервер не примет имя
         try:
@@ -2860,14 +3090,16 @@ class GiftGif(loader.Module):
                 None, lambda: GiftGif.api_sync(token, "getMe", {}))
             username = str(me.get("username") or "").strip()
         except Exception as exc:                       # noqa: BLE001
-            return await self.say(
-                message, f"❌ Бот не ответил: {esc(exc)}\n"
-                         "Проверь <code>bot_token</code> в "
-                         "<code>.cfg GiftGif</code>.")
+            text = (f"❌ Бот не ответил: {esc(exc)}\n"
+                    "Проверь <code>bot_token</code> в "
+                    "<code>.cfg GiftGif</code>.")
+            return await explain(text) if quiet else await self.say(message, text)
         short_name = ""
         card_title = self._emoji_title(stickers[0][0])
-        await self.say_update(
-            head, message, "💎 Куски готовы: %d · создаю набор…" % len(stickers))
+        if not quiet:
+            await self.say_update(
+                head, message,
+                "💎 Куски готовы: %d · создаю набор…" % len(stickers))
 
         def push(batch: list, first: bool) -> None:
             """Одна пачка: первый вызов создаёт набор, дальше только добавить."""
@@ -2935,16 +3167,19 @@ class GiftGif(loader.Module):
                 else:
                     hint = ("Полный ответ Telegram — выше. Если не ясно, "
                             "пришли его мне.")
-                return await self.say(message, emoji(
-                    "{warn:} Набор не создался: <code>" + esc(text) + "</code>\n" + hint))
+                fail = ("Набор не создался: <code>" + esc(text) + "</code> "
+                        "— " + hint)
+                return await explain(fail) if quiet else await self.say(
+                    message, emoji("{warn:} " + fail))
         packs = 0
         for start in range(0, len(rest), EMOJI_CREATE_BATCH):
             batch = rest[start:start + EMOJI_CREATE_BATCH]
             number = start // EMOJI_CREATE_BATCH + 2
-            await self.say_update(
-                head, message,
-                "💎 Загружаю в Telegram… %d/%d (пачка %d)"
-                % (len(made), len(stickers), number))
+            if not quiet:
+                await self.say_update(
+                    head, message,
+                    "💎 Загружаю в Telegram… %d/%d (пачка %d)"
+                    % (len(made), len(stickers), number))
             try:
                 await asyncio.get_running_loop().run_in_executor(
                     None, lambda b=batch: push(b, False))
@@ -2959,10 +3194,11 @@ class GiftGif(loader.Module):
         # Отчёт: что именно произошло. Раньше при сбое посреди загрузки
         # команда молчала, и понять причину было нельзя.
         took = time.time() - started
-        await self.say_update(
-            head, message,
-            "💎 Готово: %d из %d кусков за %.1f с · пачек %d"
-            % (len(made), len(stickers) or total, took, packs + 1))
+        if not quiet:
+            await self.say_update(
+                head, message,
+                "💎 Готово: %d из %d кусков за %.1f с · пачек %d"
+                % (len(made), len(stickers) or total, took, packs + 1))
         caption = (
             "{diamond:} <b>Набор премиум-эмодзи готов</b>\n"
             "Кусков: " + str(len(made)) + " · " + str(cols) + "×" + str(rows) + " "
@@ -2986,12 +3222,22 @@ class GiftGif(loader.Module):
                 "\n\n<i>Превью не собралось: " + esc(exc) + "</i>"))
         if skipped:
             caption += "\n<i>В превью не попало: " + str(len(skipped)) + "</i>"
+        if quiet:
+            # пачка ведёт общий отчёт: превью на каждый подарок завалило бы
+            # чат десятком картинок
+            with contextlib.suppress(Exception):
+                shutil.rmtree(os.path.dirname(preview), ignore_errors=True)
+            for _ref, _paths, folder, _c, _r in built:
+                with contextlib.suppress(Exception):
+                    shutil.rmtree(folder, ignore_errors=True)
+            return short_name
         await self._emoji_send(message, preview, emoji(caption))
         with contextlib.suppress(Exception):
             shutil.rmtree(os.path.dirname(preview), ignore_errors=True)
         for _ref, _paths, folder, _c, _r in built:
             with contextlib.suppress(Exception):
                 shutil.rmtree(folder, ignore_errors=True)
+        return short_name
 
     @loader.command()
     async def giftemoji_diag(self, message):
@@ -3612,7 +3858,11 @@ class GiftGif(loader.Module):
 
         def work() -> list:
             card, lottie, pattern = load_assets(ref)
-            sheet = card_picture(card, lottie, pattern)
+            # Рендерим с запасом над сеткой (8 × 100 × 1.5 = 1225) и режем
+            # уже с него. На 512 кусок выходил 64 px и растягивался до 100:
+            # контур модели «лестницей», картинка мыльная.
+            side = int(cols * EMOJI_SIDE * EMOJI_RENDER)
+            sheet = card_picture(card, lottie, pattern, side=side)
             folder = tempfile.mkdtemp(prefix="giftgif-")
             return slice_picture(sheet, folder, cols, rows)
 
