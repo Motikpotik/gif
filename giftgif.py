@@ -1,7 +1,7 @@
 # ◇━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━◇
 # meta developer: @n3post
 # scope: Heroku, Hikka
-# version: 1.5.5
+# version: 1.6.0
 # author: n3
 # Description: Подарок Telegram → анимированная карточка GIF или MP4.
 # Собирает ту же карточку, что показывает приложение: градиентный фон,
@@ -18,6 +18,14 @@
 # плитку, нижний ряд включён) — в 1.4.5 низ плитки оставался пустым.
 # 1.4.9: команда .giftest — проверка на трёх печеньках: узор по третям,
 # габарит модели, живая ли анимация, плюс скриншот кадра в чат.
+# 1.6.0: набор эмодзи стал мозаикой. Раньше каждый подарок давал свою
+# отдельную эмодзи-картинку — в панели это россыпь несвязанных картинок.
+# Теперь карточка рендерится квадратным полотном 512 и режется на 8×8
+# кусков по 100×100: в наборе они стоят по порядку и складываются в целое
+# полотно, как наборы мемов. Сетка настраивается (emoji_grid: 8x8, 6x6,
+# 10x10) и всегда квадратная — кусок 100×100 не должен ничего растягивать.
+# Куски жмутся в WEBP без потерь: на стыках lossy давал пятна, а flat-арт
+# весит копейки. Заголовок набора берётся из названия подарка.
 # 1.5.5: баг-фикс — неверный размер картинки эмодзи. Для премиум-эмодзи
 # сервер принимает ровно 100×100 px, а отправлялось 512×512 (это размер
 # обычных стикеров), из-за чего createNewStickerSet падал с
@@ -197,7 +205,7 @@ except Exception:  # pragma: no cover
     loader = utils = None
 
 
-MODULE_VERSION = "1.5.5"
+MODULE_VERSION = "1.6.0"
 
 INT64_MAX = 0x7FFFFFFFFFFFFFFF       # random_id в MTProto — знаковый int64
 
@@ -676,6 +684,14 @@ EMOJI_PREVIEW_MAX = 9              # больше плиток Telegram не п�
 EMOJI_RESERVE_MB = 64              # запас памяти: ниже — превью не собираем
 EMOJI_PATTERN_ALPHA = 90           # прозрачность мотива-силуэта под моделью
 EMOJI_MODEL_INSET = 0.62           # тело модели = 62% стороны стикера
+# Набор — это ОДНА картинка, нарезанная на квадратные куски: из них в
+# приложении складывается целое полотно. Полотно квадратное, потому что
+# плитка карточки квадратная, а сетка нарезки — N×N: так куски ровно
+# ложатся в строки панели эмодзи (как в наборах мемов: 64 эмодзи = 8×8).
+EMOJI_COLS = 8                     # кусков по горизонтали
+EMOJI_ROWS = 8                     # кусков по вертикали
+EMOJI_GRID_MAX = 10                # 10×10 = 100, потолок набора — 120
+EMOJI_EMOJI = "🎁"                 # под каким эмодзи лежит кусок
 EMOJI_STATE = ".giftemoji"         # файл-приглашение: имя → набор
 GRID_GAP = 0.03                    # зазор между плитками в сетке
 GRID_MARGIN = 0.03                 # поле страницы сетки          # координаты SVG карточки Telegram
@@ -2099,7 +2115,75 @@ def pattern_color_rgba(card: Card, alpha: int) -> tuple:
     return (int(red), int(green), int(blue), int(alpha))
 
 
-def save_emoji_sticker(image: Image.Image, path: str) -> str:
+def card_picture(card: Card, lottie_bytes: bytes, pattern,
+                 side: int = 512, inset: float = 0.68) -> Image.Image:
+    """Карточка подарка целиком, без фона страницы: градиент + модель.
+
+    Для набора-мозаики фон не нужен: тёмная подложка давала бы швы между
+    кусками. Поэтому картинка — это ровно плитка карточки, а модель и
+    силуэт узора вписаны внутрь неё.
+    """
+    width = height = int(side)
+    canvas = tile_image(card, pattern, width)
+    if canvas.size != (width, height):
+        canvas = canvas.resize((width, height), Image.Resampling.LANCZOS)
+    if pattern is not None:
+        motif_side = int(min(width, height) * 0.86)
+        mask = pattern_alpha(pattern).resize(
+            (motif_side, motif_side), Image.Resampling.LANCZOS)
+        tone = pattern_color_rgba(card, EMOJI_PATTERN_ALPHA)
+        motif = Image.new("RGBA", mask.size, tone)
+        layer = Image.new("RGBA", (width, height), (0, 0, 0, 0))
+        layer.paste(motif, ((width - motif_side) // 2,
+                            (height - motif_side) // 2), mask)
+        canvas.alpha_composite(layer)
+    try:
+        from rlottie_python import LottieAnimation
+    except ImportError as exc:
+        raise RuntimeError(
+            "нужен нативный рендер: pip install rlottie-python==1.3.8") from exc
+    metadata = json.loads(lottie_bytes)
+    padded = padded_lottie(lottie_bytes)
+    frame = int(metadata.get("ip", 0))
+    if frame >= int(metadata.get("op", 1)):
+        frame = 0
+    body = int(min(width, height) * inset)
+    animation = LottieAnimation.from_data(json.dumps(padded))
+    try:
+        model = render_model_frame(animation, frame, body)
+    finally:
+        animation.lottie_animation_destroy()
+    canvas.alpha_composite(model, ((width - model.width) // 2,
+                                   (height - model.height) // 2))
+    return canvas.convert("RGBA")
+
+
+def slice_picture(sheet: Image.Image, folder: str,
+                  cols: int = EMOJI_COLS, rows: int = EMOJI_ROWS) -> list:
+    """Разрезать картинку на cols × rows кусков и сохранить каждый в WEBP.
+
+    Куски режутся по пиксельной сетке без нахлёста: сервер принимает только
+    100×100, а нахлёст дал бы двойные линии на стыках. Возвращает пути в
+    порядке чтения — слева-направо, сверху вниз.
+    """
+    cols = max(1, min(int(cols), 10))
+    rows = max(1, min(int(rows), 10))
+    width, height = sheet.size
+    paths = []
+    for row in range(rows):
+        top = round(height * row / rows)
+        bottom = round(height * (row + 1) / rows)
+        for col in range(cols):
+            left = round(width * col / cols)
+            right = round(width * (col + 1) / cols)
+            piece = sheet.crop((left, top, right, bottom))
+            path = os.path.join(folder, "piece-%d-%d" % (row, col))
+            paths.append(save_emoji_sticker(piece, path, lossless=True))
+    return paths
+
+
+def save_emoji_sticker(image: Image.Image, path: str,
+                       lossless: bool = False) -> str:
     """Картинка-эмодзи: ровно 100×100 RGBA в WEBP.
 
     WEBP, а не PNG: это формат, который Telegram указывает в требованиях.
@@ -2111,10 +2195,19 @@ def save_emoji_sticker(image: Image.Image, path: str) -> str:
     tile = image.convert("RGBA")
     if tile.size != (EMOJI_SIDE, EMOJI_SIDE):
         tile = tile.resize((EMOJI_SIDE, EMOJI_SIDE), Image.Resampling.LANCZOS)
+    # у куска мозаики прозрачности нет намеренно: он часть целой картинки,
+    # поэтому предупреждаем только там, где это действительно ошибка
     if tile.getchannel("A").getextrema()[0] != 0:
-        logger.warning("gif: у эмодзи нет прозрачности — стикер будет квадратом")
-    quality = 95
+        logger.debug("gif: кусок без прозрачности — так и задумано для мозаики")
     target = _with_ext(path, ".webp")
+    if lossless:
+        # Куски мозаики жмутся без потерь: flat-арт весит копейки, зато на
+        # стыках кусков не остаётся пятен от lossy-сжатия — они складываются
+        # в видимые линии.
+        tile.save(target, "WEBP", lossless=True, quality=100, method=6)
+        if os.path.getsize(target) <= EMOJI_BYTES:
+            return target
+    quality = 95
     while True:
         tile.save(target, "WEBP", quality=quality, method=6)
         if os.path.getsize(target) <= EMOJI_BYTES or quality <= 70:
@@ -2288,6 +2381,13 @@ class GiftGif(loader.Module):
                 "format", "mp4",
                 "Формат по умолчанию: mp4 (легче и плавнее) или gif",
                 validator=loader.validators.Choice(["mp4", "gif"]),
+            ),
+            loader.ConfigValue(
+                "emoji_grid", "8x8",
+                "На сколько кусков резать картинку в наборе эмодзи: 8x8 = 64 "
+                "куска, 6x6 = 36, 10x10 = 100. Сетка квадратная: куски "
+                "должны ложиться в строки панели эмодзи",
+                validator=loader.validators.String(),
             ),
             loader.ConfigValue(
                 "owner_id", 0,
@@ -2693,8 +2793,10 @@ class GiftGif(loader.Module):
                 + str(bot_id) + ") — Bot API так не умеет и ответит "
                 "USER_IS_BOT.\nВ <code>owner_id</code> нужен твой личный ID, "
                 "а не бота."))
-        await self.say(message, "💎 Собираю эмодзи…" + (
-            f" ({len(refs)} шт.)" if len(refs) > 1 else ""))
+        cols, rows = self._emoji_grid(len(refs))
+        total = len(refs) * cols * rows
+        await self.say(message, "💎 Режу карточку на куски… "
+                       f"({total} шт.)")
         progress = {"at": time.time()}
         made, failures, stickers = [], [], []
         # рендер под общим замком, как у .gif: два тяжёлых кадра сразу
@@ -2702,26 +2804,29 @@ class GiftGif(loader.Module):
         async with self._render_lock:
             for index, ref in enumerate(refs, 1):
                 try:
-                    path = await self._emoji_build(ref)
+                    pieces = await self._emoji_build(ref, cols, rows)
                 except Exception as exc:               # noqa: BLE001
                     failures.append(f"{esc(ref)}: {esc(exc)}")
                     continue
                 try:
-                    with open(path, "rb") as handle:
-                        blob = handle.read()
-                    GiftGif._check_sticker(blob, ref)
-                    stickers.append((ref, blob))
+                    for part, path in enumerate(pieces, 1):
+                        with open(path, "rb") as handle:
+                            blob = handle.read()
+                        GiftGif._check_sticker(
+                            blob, "%s, кусок %d/%d" % (ref, part, len(pieces)))
+                        stickers.append((ref, blob))
                 finally:
                     with contextlib.suppress(Exception):
-                        shutil.rmtree(os.path.dirname(path), ignore_errors=True)
-                # раз в несколько подарков обновляем служебное сообщение:
-                # 120 эмодзи собираются минутами, молчание выглядит как зависание
-                if len(refs) > 3 and (index % 5 == 0 or index == len(refs)) \
+                        shutil.rmtree(os.path.dirname(pieces[0]),
+                                      ignore_errors=True)
+                # обновляем служебное сообщение: куски собираются не мгновенно
+                if (index % 5 == 0 or index == len(refs)) \
                         and time.time() - progress["at"] > 2.5:
                     progress["at"] = time.time()
                     with contextlib.suppress(Exception):
-                        await utils.answer(message, "💎 Собираю эмодзи… "
-                                           f"{index}/{len(refs)}")
+                        await utils.answer(
+                            message, "💎 Режу карточку на куски… "
+                                     f"{len(stickers)}/{total}")
                 if index < len(refs):
                     await asyncio.sleep(0.05)
         if not stickers:
@@ -2741,6 +2846,7 @@ class GiftGif(loader.Module):
                          "Проверь <code>bot_token</code> в "
                          "<code>.cfg GiftGif</code>.")
         short_name = ""
+        card_title = self._emoji_title(stickers[0][0])
 
         def push(batch: list, first: bool) -> None:
             """Одна пачка: первый вызов создаёт набор, дальше только добавить."""
@@ -2750,13 +2856,13 @@ class GiftGif(loader.Module):
                 files[key] = ("sticker%d.webp" % index, blob)
                 items.append({"sticker": "attach://" + key,
                               "format": "static",
-                              "emoji_list": ["🎁"],
+                              "emoji_list": [EMOJI_EMOJI],
                               "keywords": ["подарок", "gift"]})
             if first:
                 GiftGif.api_sync(token, "createNewStickerSet", {
                     "user_id": owner_id,
                     "name": short_name,
-                    "title": "GiftGif подарки"[:64],
+                    "title": (card_title or "GiftGif подарки")[:64],
                     "stickers": json.dumps(items),
                     "sticker_type": "custom_emoji",
                 }, files)
@@ -2803,7 +2909,8 @@ class GiftGif(loader.Module):
                 elif "STICKER_EMOJI_INVALID" in text:
                     hint = "Telegram не принял эмодзи 🎁 в этом наборе."
                 elif "DIMENSIONS" in text.upper():
-                    hint = "Картинка не 512×512 — это ошибка рендера."
+                    hint = ("Кусок вышел не 100×100 — это ошибка рендера. "
+                            "Пришли мне это сообщение целиком.")
                 else:
                     hint = ("Полный ответ Telegram — выше. Если не ясно, "
                             "пришли его мне.")
@@ -2822,7 +2929,8 @@ class GiftGif(loader.Module):
         await self._drop(message)
         caption = (
             "{diamond:} <b>Набор премиум-эмодзи готов</b>\n"
-            "Эмодзи: " + str(len(made)) + " · под 🎁\n"
+            "Кусков: " + str(len(made)) + " · " + str(cols) + "×" + str(rows) + " "
+            "на подарок · под " + EMOJI_EMOJI + "\n"
             "Открыть: <code>t.me/addemoji/" + short_name + "</code>\n\n"
             "Открой набор и нажми «Добавить» — в сообщении он появится "
             "как обычный 🎁.")
@@ -2883,6 +2991,45 @@ class GiftGif(loader.Module):
     def _emoji_room(self) -> int:
         """Сколько ещё эмодзи примет сервер: 120 — потолок статики."""
         return EMOJI_MAX
+
+    def _emoji_grid(self, count: int) -> tuple:
+        """Сколько кусков нарезать по горизонтали и вертикали.
+
+        Потолок набора — 120 кусков, поэтому на несколько подарков сетка
+        уменьшается автоматически. Пропорции держим близкими к карточке
+        (3:2), чтобы кусок не растягивался.
+        """
+        raw = str(self._conf("emoji_grid", "3x2") or "3x2").lower()
+        matched = re.match(r"^\s*(\d{1,2})\s*[xх*]\s*(\d{1,2})\s*$", raw)
+        cols = int(matched.group(1)) if matched else 3
+        rows = int(matched.group(2)) if matched else 2
+        cols = max(1, min(cols, EMOJI_GRID_MAX))
+        rows = max(1, min(rows, EMOJI_GRID_MAX))
+        # полотно квадратное, значит и сетка квадратная: кусок 100×100
+        # не должен растягивать картинку
+        cols = rows = min(cols, rows)
+        budget = EMOJI_MAX // max(1, count)
+        while cols * rows > budget and (cols > 1 or rows > 1):
+            if cols / max(1, rows) > 1.5:
+                cols -= 1
+            else:
+                rows -= 1
+        return cols, rows
+
+    def _emoji_title(self, ref: str) -> str:
+        """Заголовок набора: название подарка, как в панели эмодзи.
+
+        Общий заголовок вроде «GiftGif подарки» ничего не говорит, когда
+        наборов несколько: в панели видно имя набора, по нему и ищут.
+        """
+        name = ""
+        try:
+            card, _lottie, _pattern = load_assets(ref)
+            name = str(getattr(card, "name", "") or "").strip()
+        except Exception:                              # noqa: BLE001
+            name = ""
+        name = re.sub(r"\s+", " ", name).strip()
+        return (name or "GiftGif подарки")[:64]
 
     def _emoji_owner_id(self, message=None) -> int:
         """Владелец набора эмодзи — человек, а не бот.
@@ -3393,15 +3540,21 @@ class GiftGif(loader.Module):
             return (name[:room].strip("_") + suffix)[:64]
         return name[:64]
 
-    async def _emoji_build(self, ref: str, size: int = EMOJI_RENDER) -> str:
-        """Собрать картинку-эмодзи для одного подарка (в отдельном потоке)."""
+    async def _emoji_build(self, ref: str,
+                           cols: int = EMOJI_COLS,
+                           rows: int = EMOJI_ROWS) -> list:
+        """Подарок -> список путей к кускам 100×100 WEBP по порядку.
 
-        def work() -> str:
+        Куски — это одна картинка карточки, разрезанная по сетке
+        cols × rows. В наборе они стоят по порядку, поэтому в приложении
+        складываются в целое полотно. Порядок: слева-направо, сверху вниз.
+        """
+
+        def work() -> list:
             card, lottie, pattern = load_assets(ref)
-            # размер — это размер рендера; в файл всё равно уйдёт 100×100
-            layer = emoji_layer(card, lottie, pattern, size)
+            sheet = card_picture(card, lottie, pattern)
             folder = tempfile.mkdtemp(prefix="giftgif-")
-            return save_emoji_sticker(layer, os.path.join(folder, "emoji.png"))
+            return slice_picture(sheet, folder, cols, rows)
 
         return await asyncio.get_running_loop().run_in_executor(None, work)
 
