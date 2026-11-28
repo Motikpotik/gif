@@ -1,7 +1,7 @@
 # ◇━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━◇
 # meta developer: @n3post
 # scope: Heroku, Hikka
-# version: 1.6.0
+# version: 1.6.1
 # author: n3
 # Description: Подарок Telegram → анимированная карточка GIF или MP4.
 # Собирает ту же карточку, что показывает приложение: градиентный фон,
@@ -18,6 +18,11 @@
 # плитку, нижний ряд включён) — в 1.4.5 низ плитки оставался пустым.
 # 1.4.9: команда .giftest — проверка на трёх печеньках: узор по третям,
 # габарит модели, живая ли анимация, плюс скриншот кадра в чат.
+# 1.6.1: превью показывает саму мозаику. Раньше оно рендерило карточки
+# заново по ссылкам и складывало сеткой 3×3 — на выходе девять одинаковых
+# пряников вместо полотна и счётчик «в превью не попало». Теперь превью
+# склеивается из тех же кусков, что ушли в набор, поэтому видно ровно то,
+# что получилось. Папки с кусками убираются после отправки.
 # 1.6.0: набор эмодзи стал мозаикой. Раньше каждый подарок давал свою
 # отдельную эмодзи-картинку — в панели это россыпь несвязанных картинок.
 # Теперь карточка рендерится квадратным полотном 512 и режется на 8×8
@@ -205,7 +210,7 @@ except Exception:  # pragma: no cover
     loader = utils = None
 
 
-MODULE_VERSION = "1.6.0"
+MODULE_VERSION = "1.6.1"
 
 INT64_MAX = 0x7FFFFFFFFFFFFFFF       # random_id в MTProto — знаковый int64
 
@@ -2182,6 +2187,17 @@ def slice_picture(sheet: Image.Image, folder: str,
     return paths
 
 
+def _tile_pieces(paths: list, cols: int, rows: int) -> Image.Image:
+    """Склеить куски обратно в полотно: по ним видно, что ушло в набор."""
+    tile = 100
+    canvas = Image.new("RGB", (cols * tile, rows * tile), (0, 0, 0))
+    for index, path in enumerate(paths[:cols * rows]):
+        row, col = divmod(index, cols)
+        with Image.open(path) as piece:
+            canvas.paste(piece.convert("RGB"), (col * tile, row * tile))
+    return canvas
+
+
 def save_emoji_sticker(image: Image.Image, path: str,
                        lossless: bool = False) -> str:
     """Картинка-эмодзи: ровно 100×100 RGBA в WEBP.
@@ -2799,12 +2815,13 @@ class GiftGif(loader.Module):
                        f"({total} шт.)")
         progress = {"at": time.time()}
         made, failures, stickers = [], [], []
+        built = []
         # рендер под общим замком, как у .gif: два тяжёлых кадра сразу
         # удваивают память, а на хосте бота её и так немного
         async with self._render_lock:
             for index, ref in enumerate(refs, 1):
                 try:
-                    pieces = await self._emoji_build(ref, cols, rows)
+                    pieces, folder = await self._emoji_pieces(ref, cols, rows)
                 except Exception as exc:               # noqa: BLE001
                     failures.append(f"{esc(ref)}: {esc(exc)}")
                     continue
@@ -2815,10 +2832,11 @@ class GiftGif(loader.Module):
                         GiftGif._check_sticker(
                             blob, "%s, кусок %d/%d" % (ref, part, len(pieces)))
                         stickers.append((ref, blob))
-                finally:
+                    built.append((ref, pieces, folder, cols, rows))
+                except Exception as exc:               # noqa: BLE001
+                    failures.append(f"{esc(ref)}: {esc(exc)}")
                     with contextlib.suppress(Exception):
-                        shutil.rmtree(os.path.dirname(pieces[0]),
-                                      ignore_errors=True)
+                        shutil.rmtree(folder, ignore_errors=True)
                 # обновляем служебное сообщение: куски собираются не мгновенно
                 if (index % 5 == 0 or index == len(refs)) \
                         and time.time() - progress["at"] > 2.5:
@@ -2936,9 +2954,12 @@ class GiftGif(loader.Module):
             "как обычный 🎁.")
         if failures:
             caption += "\n\n⚠️ Не вышло: " + "; ".join(failures[:3])
+        # превью — из тех же кусков, что ушли в набор: одно полотно, а не
+        # девять перерисованных карточек
+        jobs = [(ref, paths, cols, rows)
+                for ref, paths, _folder, cols, rows in built]
         try:
-            preview, skipped = await self._emoji_preview(
-                made, EMOJI_PREVIEW_SIDE)
+            preview, skipped = await self._emoji_preview(jobs, EMOJI_PREVIEW_SIDE)
         except Exception as exc:                       # noqa: BLE001
             logger.exception("gif: превью не собралось")
             return await self.say(message, emoji(caption) + (
@@ -2948,6 +2969,9 @@ class GiftGif(loader.Module):
         await self._emoji_send(message, preview, emoji(caption))
         with contextlib.suppress(Exception):
             shutil.rmtree(os.path.dirname(preview), ignore_errors=True)
+        for _ref, _paths, folder, _c, _r in built:
+            with contextlib.suppress(Exception):
+                shutil.rmtree(folder, ignore_errors=True)
 
     @loader.command()
     async def giftemoji_diag(self, message):
@@ -3558,45 +3582,50 @@ class GiftGif(loader.Module):
 
         return await asyncio.get_running_loop().run_in_executor(None, work)
 
-    async def _emoji_preview(self, refs: list, size: int) -> tuple:
-        """Итоговая картинка набора: эмодзи плитками, не больше девяти.
+    async def _emoji_pieces(self, ref, cols, rows) -> tuple:
+        """Как `_emoji_build`, но отдаёт и папку: по ней превью склеивает
+        мозаику из тех же кусков, что ушли в набор, и потом убирает её."""
+        paths = await self._emoji_build(ref, cols, rows)
+        return paths, os.path.dirname(paths[0])
 
-        Плитки собираются по одной и сразу вклеиваются в холст: держать
-        все слои в памяти нельзя — 120 кадров по 512 px это ~120 МБ, а на
-        хосте бота свободны десятки мегабайт.
+    async def _emoji_preview(self, jobs: list, size: int) -> tuple:
+        """Превью набора: та же мозаика, что ушла в Telegram.
+
+        Раньше превью рендерило карточки заново по ссылкам и складывало их
+        сеткой 3×3 — на выходе были девять одинаковых пряников вместо
+        целого полотна. Теперь куски уже готовы, поэтому мозаика
+        склеивается из них, и видно ровно то, что попало в набор.
         """
-        refs = refs[:EMOJI_PREVIEW_MAX]
 
         def work() -> tuple:
-            skip = max(0, len(refs) - EMOJI_PREVIEW_MAX)
-            per_row = 3 if len(refs) > 1 else 1
-            gap = max(4, size // 32)
-            rows = math.ceil(len(refs) / per_row)
-            sheet = Image.new("RGBA", (per_row * size + (per_row + 1) * gap,
-                                       rows * size + (rows + 1) * gap),
-                              (16, 16, 16, 255))
-            drawn, skipped = 0, []
-            for ref in refs:
+            drawn, skipped = [], []
+            widest = 0
+            for ref, paths, cols, rows in jobs:
                 try:
-                    card, lottie, pattern = load_assets(ref)
-                    layer = emoji_layer(card, lottie, pattern, size)
+                    sheet = _tile_pieces(paths, cols, rows)
                 except Exception as exc:               # noqa: BLE001
                     skipped.append((ref, exc))
                     continue
-                row, col = divmod(drawn, per_row)
-                cell = Image.new("RGBA", (size, size), (30, 30, 34, 255))
-                cell.alpha_composite(layer)
-                del layer
-                sheet.alpha_composite(cell, (gap + col * (size + gap),
-                                             gap + row * (size + gap)))
-                drawn += 1
+                drawn.append(sheet)
+                widest = max(widest, sheet.width)
             if not drawn:
                 raise RuntimeError("ни один подарок не собрался")
+            gap = max(6, size // 64)
+            total_h = sum(item.height for item in drawn) + gap * (len(drawn) + 1)
+            canvas = Image.new("RGB", (widest + gap * 2, total_h),
+                               (16, 16, 16))
+            top = gap
+            for item in drawn:
+                if item.width != widest:
+                    item = item.resize(
+                        (widest, round(item.height * widest / item.width)),
+                        Image.Resampling.LANCZOS)
+                canvas.paste(item, (gap, top))
+                top += item.height + gap
             folder = tempfile.mkdtemp(prefix="giftgif-")
             target = os.path.join(folder, "preview.png")
-            sheet.convert("RGB").save(target, "PNG", optimize=True)
-            return target, skipped + ([("ещё %d" % skip, "не влезли в превью")]
-                                      if skip else [])
+            canvas.save(target, "PNG", optimize=True)
+            return target, skipped
 
         return await asyncio.get_running_loop().run_in_executor(None, work)
 
