@@ -1,7 +1,7 @@
 # ◇━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━◇
 # meta developer: @n3post
 # scope: Heroku, Hikka
-# version: 1.5.4
+# version: 1.5.5
 # author: n3
 # Description: Подарок Telegram → анимированная карточка GIF или MP4.
 # Собирает ту же карточку, что показывает приложение: градиентный фон,
@@ -18,6 +18,13 @@
 # плитку, нижний ряд включён) — в 1.4.5 низ плитки оставался пустым.
 # 1.4.9: команда .giftest — проверка на трёх печеньках: узор по третям,
 # габарит модели, живая ли анимация, плюс скриншот кадра в чат.
+# 1.5.5: баг-фикс — неверный размер картинки эмодзи. Для премиум-эмодзи
+# сервер принимает ровно 100×100 px, а отправлялось 512×512 (это размер
+# обычных стикеров), из-за чего createNewStickerSet падал с
+# STICKER_PNG_DIMENSIONS. Теперь рендер идёт в 512 и ужимается Ланцошем в
+# 100 — так картинка остаётся резкой; превью набора по-прежнему 512.
+# Плюс проверка перед отправкой: размер и формат каждого файла сверяются
+# у себя, и в ошибке видно, какой подарок виноват.
 # 1.5.4: USER_IS_BOT. В createNewStickerSet user_id — это ВЛАДЕЛЕЦ
 # набора, человек, а не бот. Я подставлял туда id бота (он зашит в токен
 # до двоеточия), Telegram и отвечал USER_IS_BOT. Владелец теперь: настройка
@@ -190,7 +197,7 @@ except Exception:  # pragma: no cover
     loader = utils = None
 
 
-MODULE_VERSION = "1.5.4"
+MODULE_VERSION = "1.5.5"
 
 INT64_MAX = 0x7FFFFFFFFFFFFFFF       # random_id в MTProto — знаковый int64
 
@@ -655,7 +662,13 @@ MAX_TILES = 9                      # максимум плиток в сетке
 BATCH_DELAY = 1.0                  # пауза между отправками, секунды
 CARD_W, CARD_H = 420, 280
 # --- премиум-эмодзи (статичные стикеры набора emojis=True) ---
-EMOJI_SIDE = 512                   # обязательная сторона стикера, ровно 512
+# Премиум-эмодзи — это не обычный стикер: сервер требует ровно 100×100 px.
+# С 512×512 createNewStickerSet отвечает STICKER_PNG_DIMENSIONS: 512 — это
+# размер обычных стикеров, у custom_emoji своя сетка.
+EMOJI_SIDE = 100                   # сторона картинки-эмодзи, ровно 100
+EMOJI_RENDER = 512                 # из такого размера ужимаем в 100: с 512
+                                   # картинка остаётся резкой, с 100 — мыло
+EMOJI_PREVIEW_SIDE = 512           # превью набора — обычное фото, не эмодзи
 EMOJI_BYTES = 480 * 1024           # сервер не примет больше 512 КБ, берём запас
 EMOJI_MAX = 120                    # статичных стикеров сервер держит до 120
 EMOJI_CREATE_BATCH = 50            # createNewStickerSet принимает до 50 за раз
@@ -2087,11 +2100,13 @@ def pattern_color_rgba(card: Card, alpha: int) -> tuple:
 
 
 def save_emoji_sticker(image: Image.Image, path: str) -> str:
-    """Статичный стикер: ровно 512×512 RGBA в WEBP.
+    """Картинка-эмодзи: ровно 100×100 RGBA в WEBP.
 
-    WEBP, а не PNG: это формат, который Telegram указывает в требованиях
-    к статичным стикерам. Сторона всегда 512 — если рендерить меньше и
-    потом тянуть вверх, стикер получается мыльным.
+    WEBP, а не PNG: это формат, который Telegram указывает в требованиях.
+    Сторона именно 100: для custom_emoji сервер принимает только 100×100,
+    на 512 отвечает STICKER_PNG_DIMENSIONS. Рендерим крупно и ужимаем
+    Ланцошем — из 512 в 100 картинка выходит резкой, а рендер сразу в 100
+    даёт мыло.
     """
     tile = image.convert("RGBA")
     if tile.size != (EMOJI_SIDE, EMOJI_SIDE):
@@ -2694,6 +2709,7 @@ class GiftGif(loader.Module):
                 try:
                     with open(path, "rb") as handle:
                         blob = handle.read()
+                    GiftGif._check_sticker(blob, ref)
                     stickers.append((ref, blob))
                 finally:
                     with contextlib.suppress(Exception):
@@ -2813,7 +2829,8 @@ class GiftGif(loader.Module):
         if failures:
             caption += "\n\n⚠️ Не вышло: " + "; ".join(failures[:3])
         try:
-            preview, skipped = await self._emoji_preview(made, EMOJI_SIDE)
+            preview, skipped = await self._emoji_preview(
+                made, EMOJI_PREVIEW_SIDE)
         except Exception as exc:                       # noqa: BLE001
             logger.exception("gif: превью не собралось")
             return await self.say(message, emoji(caption) + (
@@ -2890,6 +2907,28 @@ class GiftGif(loader.Module):
             if candidate > 0:
                 return candidate
         return 0
+
+    @staticmethod
+    @staticmethod
+    def _check_sticker(blob: bytes, ref: str = "") -> None:
+        """Убедиться, что картинка ровно 100×100 и это WEBP.
+
+        Сервер отвечает STICKER_PNG_DIMENSIONS, если сторона хоть на
+        пиксель другая, а по ответу не видно, какой файл виноват. Лучше
+        поймать это у себя и назвать подарок.
+        """
+        try:
+            with Image.open(io.BytesIO(blob)) as probe:
+                size = probe.size
+                fmt = probe.format
+        except Exception as exc:                       # noqa: BLE001
+            raise RuntimeError("эмодзи %s не читается: %s" % (ref, exc)) from exc
+        if size != (EMOJI_SIDE, EMOJI_SIDE):
+            raise RuntimeError(
+                "эмодзи %s вышел %d×%d вместо %d×%d"
+                % (ref, size[0], size[1], EMOJI_SIDE, EMOJI_SIDE))
+        if fmt != "WEBP":
+            raise RuntimeError("эмодзи %s в формате %s, нужен WEBP" % (ref, fmt))
 
     @staticmethod
     def _emoji_bot_id(token: str) -> int:
@@ -3354,11 +3393,12 @@ class GiftGif(loader.Module):
             return (name[:room].strip("_") + suffix)[:64]
         return name[:64]
 
-    async def _emoji_build(self, ref: str, size: int = EMOJI_SIDE) -> str:
+    async def _emoji_build(self, ref: str, size: int = EMOJI_RENDER) -> str:
         """Собрать картинку-эмодзи для одного подарка (в отдельном потоке)."""
 
         def work() -> str:
             card, lottie, pattern = load_assets(ref)
+            # размер — это размер рендера; в файл всё равно уйдёт 100×100
             layer = emoji_layer(card, lottie, pattern, size)
             folder = tempfile.mkdtemp(prefix="giftgif-")
             return save_emoji_sticker(layer, os.path.join(folder, "emoji.png"))
